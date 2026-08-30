@@ -146,7 +146,11 @@ pipeline {
                     // Resolved once, used consistently by both the OpenSearch stage
                     // and the Dashboards stage, instead of relying on a separate
                     // Jenkins credential (see v2 fix #5 in the header comment).
-                    RESOLVED_OS_ADMIN_PASSWORD = params.OS_ADMIN_PASSWORD?.trim() ?: 'EdxiP@ssword!'
+                    // OS_ADMIN_PASSWORD is a password-type parameter, so Jenkins hands it
+                    // back as a hudson.util.Secret object, not a plain String - Secret has
+                    // no .trim() method, so it must be converted to a String first.
+                    def osAdminPasswordPlain = params.OS_ADMIN_PASSWORD?.toString()
+                    RESOLVED_OS_ADMIN_PASSWORD = osAdminPasswordPlain?.trim() ?: 'EdxiP@ssword!'
                 }
             }
         }
