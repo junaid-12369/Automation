@@ -52,6 +52,12 @@
       from `sudo -n VAR=value bash script` (unreliable - depends on sudoers
       env_keep/setenv policy) to `sudo -n env VAR=value bash script`, which
       reliably sets the variable regardless of sudoers env settings.
+   6. DRUID_VOLUME_NAME was always resolved as /opt/<value>, so entering a
+      full path like '/data' produced '/opt//data' instead of installing
+      directly into /data. The pre-flight mkdir stage now resolves the path
+      the same way druid_install.sh v6 does: a value starting with '/' is
+      used as-is, a bare name is still nested under /opt, and 'root' means
+      /opt on the root volume.
  =============================================================================
 */
 
@@ -98,7 +104,7 @@ pipeline {
         string(name: 'OSD_OS_USER', defaultValue: 'admin', description: 'OpenSearch admin username')
         string(name: 'OSD_BIND_HOST', defaultValue: '0.0.0.0', description: 'Address Dashboards listens on')
 
-        string(name: 'DRUID_VOLUME_NAME', defaultValue: 'ausiytic', description: "Volume name under /opt on DB2_SERVER, or 'root' for the root volume")
+        string(name: 'DRUID_VOLUME_NAME', defaultValue: 'ausiytic', description: "Where to install Druid on DB2_SERVER: a full absolute path (e.g. '/data') installs directly into it; a bare name (e.g. 'ausiytic') nests under /opt; 'root' uses /opt on the root volume")
         booleanParam(name: 'DRUID_RECONFIGURE', defaultValue: false, description: 'Pass --reconfigure to druid_install.sh. REQUIRED if this server was ever installed before with this script and you want to change ANY Druid setting below — otherwise the script silently reuses its saved /etc/druid-install/state.env and ignores every parameter here.')
         booleanParam(name: 'DRUID_USE_POSTGRES', defaultValue: false, description: 'Use the PostgreSQL master above as Druid metadata store instead of embedded Derby')
         string(name: 'DRUID_PG_PORT', defaultValue: '5432', description: 'Only used if DRUID_USE_POSTGRES is true')
@@ -210,9 +216,20 @@ pipeline {
             steps {
                 script {
                     // druid_install.sh's prompt_volume() loops forever re-reading stdin
-                    // if /opt/<volume> doesn't already exist as a directory, which
-                    // desyncs every answer piped in after it (see v2 fix #2).
-                    def volDir = "/opt/${params.DRUID_VOLUME_NAME.trim()}"
+                    // if the resolved BASE_PATH doesn't already exist as a directory,
+                    // which desyncs every answer piped in after it (see v2 fix #2).
+                    // Resolve the path the SAME way druid_install.sh v6 does, so the
+                    // directory we pre-create is the one the script will actually use:
+                    //   - starts with '/'  -> absolute path, used as-is (v2 fix #6)
+                    //   - otherwise        -> bare name, nested under /opt
+                    def resolveDruidBasePath = { String raw ->
+                        def trimmed = raw.trim().replaceAll('/+$', '')
+                        if (trimmed.startsWith('/')) {
+                            return trimmed
+                        }
+                        return "/opt/${trimmed}"
+                    }
+                    def volDir = resolveDruidBasePath(params.DRUID_VOLUME_NAME)
                     sshRunCommand(params.DB2_SERVER, "sudo -n mkdir -p '${volDir}'")
                 }
             }

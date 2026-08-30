@@ -29,7 +29,13 @@
 #
 # IMPLEMENTATION
 #   Author  - EverestDx (standardized/automated version)
-#   Version - v5
+#   Version - v6
+#     v6: prompt_volume() now distinguishes a bare volume name
+#         (e.g. 'ausiytic', still nested under /opt for backward
+#         compatibility) from a full absolute path (e.g. '/data'),
+#         which is now used exactly as given instead of being
+#         nested under /opt (previously '/data' silently became
+#         '/opt//data').
 #     v5: prompt_volume() now accepts either a bare volume name
 #         (e.g. 'ausiytic') or a full path (e.g. '/opt/ausiytic' or
 #         'ausiytic/') and normalizes it, instead of silently
@@ -339,22 +345,19 @@ ROOT_DEVICE="$(findmnt -no SOURCE / 2>/dev/null || true)"
 
 prompt_volume() {
     while true; do
-        read -rp "Enter the volume name mounted under /opt (e.g. 'ausiytic'), or 'root' to use the root volume: " VOLUME_NAME_RAW
+        read -rp "Enter a volume name to nest under /opt (e.g. 'ausiytic'), a full absolute path to install into directly (e.g. '/data'), or 'root' to use /opt on the root volume: " VOLUME_NAME_RAW
 
         if [[ -z "$VOLUME_NAME_RAW" ]]; then
-            echo "Volume name cannot be empty. Try again."
+            echo "Input cannot be empty. Try again."
             continue
         fi
 
-        # Normalize input so both a bare name ('ausiytic') and a full
-        # path ('/opt/ausiytic', 'opt/ausiytic', 'ausiytic/') work the
-        # same way, instead of double-prefixing to /opt//opt/ausiytic.
-        VOLUME_NAME="$VOLUME_NAME_RAW"
-        VOLUME_NAME="${VOLUME_NAME#/opt/}"   # strip leading /opt/
-        VOLUME_NAME="${VOLUME_NAME#opt/}"    # strip leading opt/
-        VOLUME_NAME="${VOLUME_NAME%/}"       # strip trailing slash
+        # Strip a trailing slash regardless of which form was given
+        # ('/data/', 'ausiytic/', 'root/' all behave like their
+        # unslashed counterparts).
+        local trimmed="${VOLUME_NAME_RAW%/}"
 
-        if [[ "$VOLUME_NAME" == "root" || "$VOLUME_NAME" == "/" || -z "$VOLUME_NAME" ]]; then
+        if [[ "$trimmed" == "root" || "$trimmed" == "/opt" || -z "$trimmed" ]]; then
             BASE_PATH="/opt"
             VOLUME_NAME="root"
             mkdir -p "$BASE_PATH"
@@ -362,14 +365,23 @@ prompt_volume() {
             break
         fi
 
-        BASE_PATH="/opt/${VOLUME_NAME}"
-
-        if [ "$VOLUME_NAME_RAW" != "$VOLUME_NAME" ]; then
-            log "INFO" "Interpreted '$VOLUME_NAME_RAW' as volume name '$VOLUME_NAME' -> $BASE_PATH"
+        if [[ "$trimmed" == /* ]]; then
+            # A full absolute path (e.g. '/data') - install directly
+            # into it. Do NOT nest this under /opt.
+            BASE_PATH="$trimmed"
+            VOLUME_NAME="$(basename "$trimmed")"
+            log "INFO" "Interpreted '$VOLUME_NAME_RAW' as an absolute path -> $BASE_PATH (not nested under /opt)"
+        else
+            # A bare name - tolerate an accidental leading 'opt/' and
+            # nest it under /opt, same as before, for backward
+            # compatibility with existing hosts/state files that used
+            # this form.
+            VOLUME_NAME="${trimmed#opt/}"
+            BASE_PATH="/opt/${VOLUME_NAME}"
         fi
 
         if [ ! -d "$BASE_PATH" ]; then
-            echo "Path '$BASE_PATH' does not exist. Please mount the volume at ${BASE_PATH} first, then re-run (or type 'root' to use the root volume instead)."
+            echo "Path '$BASE_PATH' does not exist. Please create/mount it first, then re-run (or type 'root' to use the root volume instead)."
             continue
         fi
 
