@@ -65,7 +65,6 @@ pipeline {
     }
 
     parameters {
-        separator(name: 'SSH_SEC', sectionHeader: 'SSH / connection')
         string(name: 'SSH_USER', defaultValue: 'ubuntu', description: 'OS login user on all 4 target servers')
         string(name: 'SSH_CREDENTIALS_ID', defaultValue: 'aws-ubuntu-ssh', description: 'Jenkins credential ID of the SSH private key (SSH Username with private key)')
         string(name: 'APP_SERVER', defaultValue: '172.31.3.85', description: 'Apache httpd + OpenSearch Dashboards')
@@ -73,7 +72,6 @@ pipeline {
         string(name: 'DB1_SERVER', defaultValue: '172.31.6.212', description: 'PostgreSQL + OpenSearch standalone')
         string(name: 'DB2_SERVER', defaultValue: '172.31.11.87', description: 'Druid standalone')
 
-        separator(name: 'STAGE_SEC', sectionHeader: 'Which services to (re)install this run')
         booleanParam(name: 'DEPLOY_POSTGRES', defaultValue: true, description: 'Run pg_install_master.sh on DB1_SERVER')
         booleanParam(name: 'DEPLOY_OPENSEARCH', defaultValue: true, description: 'Run opensearch_install.sh on DB1_SERVER')
         booleanParam(name: 'DEPLOY_DRUID', defaultValue: true, description: 'Run druid_install.sh on DB2_SERVER')
@@ -81,7 +79,6 @@ pipeline {
         booleanParam(name: 'DEPLOY_APACHE', defaultValue: true, description: 'Run install_apache_httpd.sh on APP_SERVER')
         booleanParam(name: 'DEPLOY_DASHBOARDS', defaultValue: true, description: 'Run opensearch_dashboards_install.sh on APP_SERVER (needs OpenSearch already up on DB1_SERVER)')
 
-        separator(name: 'PG_SEC', sectionHeader: 'PostgreSQL master (pg_install_master.sh)')
         string(name: 'PG_VERSION', defaultValue: '17.6', description: 'PostgreSQL version to build')
         string(name: 'PG_BASE_DIR', defaultValue: '/data', description: 'Base install path on DB1_SERVER (never /, /etc, /home, etc.)')
         string(name: 'PG_PORT', defaultValue: '5432', description: 'PostgreSQL port')
@@ -91,19 +88,16 @@ pipeline {
         booleanParam(name: 'PG_OPEN_CLIENT_ACCESS', defaultValue: false, description: 'Allow app clients from 0.0.0.0/0 with password auth')
         string(name: 'PG_APP_DB', defaultValue: 'appdb', description: 'Initial application database name')
 
-        separator(name: 'OS_SEC', sectionHeader: 'OpenSearch (opensearch_install.sh)')
         string(name: 'OS_BASE_DIR', defaultValue: '/data/opensearch', description: 'Base disk/dir on DB1_SERVER (do NOT use / — see prior disk-space incident)')
         string(name: 'OS_CLUSTER_NAME', defaultValue: 'dev-01', description: 'OpenSearch cluster name')
         password(name: 'OS_ADMIN_PASSWORD', defaultValue: '', description: 'Initial admin password (leave blank to use the script default EdxiP@ssword! — change this in production). Used for BOTH the OpenSearch stage and the Dashboards stage, so they always agree.')
 
-        separator(name: 'OSD_SEC', sectionHeader: 'OpenSearch Dashboards (opensearch_dashboards_install.sh)')
         string(name: 'OSD_BASE_DIR', defaultValue: '/data/opensearch-dashboards', description: 'Base disk/dir on APP_SERVER')
         string(name: 'OSD_OS_HOST', defaultValue: '172.31.6.212', description: 'OpenSearch host Dashboards connects to (= DB1_SERVER)')
         string(name: 'OSD_OS_PORT', defaultValue: '9200', description: 'OpenSearch HTTP port')
         string(name: 'OSD_OS_USER', defaultValue: 'admin', description: 'OpenSearch admin username')
         string(name: 'OSD_BIND_HOST', defaultValue: '0.0.0.0', description: 'Address Dashboards listens on')
 
-        separator(name: 'DRUID_SEC', sectionHeader: 'Druid (druid_install.sh)')
         string(name: 'DRUID_VOLUME_NAME', defaultValue: 'ausiytic', description: "Volume name under /opt on DB2_SERVER, or 'root' for the root volume")
         booleanParam(name: 'DRUID_RECONFIGURE', defaultValue: false, description: 'Pass --reconfigure to druid_install.sh. REQUIRED if this server was ever installed before with this script and you want to change ANY Druid setting below — otherwise the script silently reuses its saved /etc/druid-install/state.env and ignores every parameter here.')
         booleanParam(name: 'DRUID_USE_POSTGRES', defaultValue: false, description: 'Use the PostgreSQL master above as Druid metadata store instead of embedded Derby')
@@ -118,14 +112,12 @@ pipeline {
         string(name: 'DRUID_ADMIN_PASSWORD', defaultValue: '', description: 'Blank = script auto-generates a random one')
         string(name: 'DRUID_INTERNAL_PASSWORD', defaultValue: '', description: 'Blank = script auto-generates a random one')
 
-        separator(name: 'NIFI_SEC', sectionHeader: 'NiFi (install_nifi.sh)')
         string(name: 'NIFI_BASE_DIR', defaultValue: '/opt/ausiytic', description: "Base path on DI_SERVER, or / for root volume")
         string(name: 'NIFI_ADMIN_USER', defaultValue: 'admin', description: 'NiFi UI login username')
         string(name: 'NIFI_ADMIN_PASSWORD', defaultValue: '', description: 'NiFi UI login password, min 12 chars (REQUIRED — no safe default)')
         choice(name: 'NIFI_PROXY_CHOICE', choices: ['2', '1', '3', '4'], description: 'nifi.web.proxy.host source: 1=Public IP 2=Private IP(default, intra-VPC) 3=Both 4=Custom hostname')
         string(name: 'NIFI_CUSTOM_HOST', defaultValue: '', description: 'Only used if NIFI_PROXY_CHOICE=4')
 
-        separator(name: 'HTTPD_SEC', sectionHeader: 'Apache httpd (install_apache_httpd.sh)')
         string(name: 'HTTPD_BASE_DIR', defaultValue: '/opt/ausiytic', description: 'Base install directory on APP_SERVER')
     }
 
