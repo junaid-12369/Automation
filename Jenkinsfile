@@ -1,63 +1,95 @@
 /*
  =============================================================================
- Multi-server automated deployment pipeline
+ Reusable multi-server deployment pipeline  (v4 - config driven)
  =============================================================================
- Targets:
-   APP_SERVER (172.31.3.85)  -> install_apache_httpd.sh, opensearch_dashboards_install.sh
-   DI_SERVER  (172.31.10.254)-> install_nifi.sh
-   DB1_SERVER (172.31.6.212) -> pg_install_master.sh, opensearch_install.sh
-   DB2_SERVER (172.31.11.87) -> druid_install.sh
+ HOW THIS WORKS
+   Everything project-specific lives in ONE place: projectConfig() below
+   (servers + a list of "tasks"). The pipeline itself never changes between
+   projects. A task = "run script X on host Y with these inputs".
 
- All five scripts are 100% interactive (bash `read` prompts). Since Jenkins
- can't type into a TTY, every prompt's answer is pre-built (in the exact
- order the script asks for it) from build parameters below and piped into
- the script over SSH via stdin (a heredoc). If you ever edit a script and
- add/remove/reorder a `read`/`ask` call, the matching stdin block here must
- be updated to match, or the wrong answer will land on the wrong prompt.
+   - Tasks have a `wave` number. Waves run in ascending order (use them for
+     dependencies: DB before app, Spark master before Spark workers, ...).
+   - Inside a wave, tasks on DIFFERENT hosts run in parallel; tasks on the
+     SAME host always run one after another (avoids apt/dpkg lock clashes).
+   - N workers? Just add hosts to a list (see AIRFLOW_WORKER_HOSTS /
+     SPARK_WORKER_HOSTS) - tasks are generated with a for-loop.
 
- Assumptions:
-   - Passwordless sudo is configured for SSH_USER on all 4 targets
-     (typical default for ubuntu/ec2-user AMIs). If not, sudo will hang
-     waiting for a TTY password and the stage will time out.
-   - The 5 scripts live in this Jenkins repo under ./scripts/
-   - An SSH private-key credential is stored in Jenkins with the ID given
-     in SSH_CREDENTIALS_ID
-   - This job is configured as "Pipeline script from SCM" pointing at the
-     repo containing ./scripts/ - `checkout scm` will fail otherwise.
+ PLACING SERVICES ON SERVERS  (the build parameter SERVERS)
+   Give the pipeline your servers and say which services each one gets - any
+   service on any server, any number of servers, several services per server:
 
- v2 fixes applied (found by reading the actual install scripts line-by-line):
-   1. druid_install.sh persists all answers to /etc/druid-install/state.env
-      on the target server and silently REUSES them on every later run,
-      ignoring new parameters, unless invoked with --reconfigure. Added
-      DRUID_RECONFIGURE param + a pre-flight stage that passes the flag.
-   2. druid_install.sh's prompt_volume() loops forever re-reading stdin if
-      /opt/<volume> doesn't already exist, desyncing every answer after it.
-      Added a pre-flight stage that mkdir -p's the volume dir first.
-   3. install_nifi.sh's prompt_disk() hard-dies (does not create the dir)
-      if the base path doesn't already exist. Added a pre-flight stage that
-      mkdir -p's it first.
-   4. opensearch_dashboards_install.sh can only auto-find OpenSearch's
-      root-ca.pem on its OWN filesystem - but Dashboards runs on APP_SERVER
-      while the CA lives on DB1_SERVER. Added a stage that copies the CA
-      from DB1_SERVER to APP_SERVER (via the Jenkins agent) before running
-      Dashboards, and passes --opensearch-root-ca. Failure to fetch it is
-      non-fatal - the script itself falls back to unverified TLS with a
-      warning, same as before this fix.
-   5. Removed the separate 'opensearch-admin-password' Jenkins credential
-      requirement (it hard-failed the whole build if that credential ID
-      didn't exist, even when OS_ADMIN_PASSWORD was intentionally left
-      blank). The admin password is now resolved ONCE from OS_ADMIN_PASSWORD
-      (falling back to the script's own default) and reused consistently
-      for both the OpenSearch stage and the Dashboards stage. Also switched
-      from `sudo -n VAR=value bash script` (unreliable - depends on sudoers
-      env_keep/setenv policy) to `sudo -n env VAR=value bash script`, which
-      reliably sets the variable regardless of sudoers env settings.
-   6. DRUID_VOLUME_NAME was always resolved as /opt/<value>, so entering a
-      full path like '/data' produced '/opt//data' instead of installing
-      directly into /data. The pre-flight mkdir stage now resolves the path
-      the same way druid_install.sh v6 does: a value starting with '/' is
-      used as-is, a bare name is still nested under /opt, and 'root' means
-      /opt on the root volume.
+       10.0.1.21 = pg, opensearch
+       10.0.1.22 = airflow-control, kafka, nifi
+       10.0.1.23 = airflow-worker, spark-worker, chrome, nifi
+       10.0.1.24 = airflow-worker, spark-worker
+       10.0.1.25 = spark-master, polaris, hive, presto
+
+   When SERVERS is filled in, EXACTLY the listed services run, on exactly those
+   hosts (enabled flags are ignored). Services that may go on many servers:
+   airflow-worker, spark-worker, kafka, chrome, nifi (1 host = standalone,
+   2 hosts = 2-node cluster; the FIRST host listed is Node 1). All others go on
+   ONE server. Service names: see knownServices() near the bottom. Several
+   services on the same host install one after another; different hosts install
+   in parallel. Values for things NOT placed this run (e.g. the Airflow control
+   IP when you only add a worker, or an existing Redis) come from the defaults
+   in projectConfig() or from OVERRIDES (e.g. REDIS_HOST=10.0.1.30).
+   Leave SERVERS blank to use the per-role parameters / defaults instead.
+
+ TWO TASK MODES
+   mode:'env'   (default) Script supports AUTOMATED=1 + env vars
+                (airflow_cluster_*.sh, spark_install.sh, spark_standalone_install.sh,
+                 redis_install.sh, install_hadoop_hive.sh, install_presto.sh).
+                All of task.env + credentials are exported to the script.
+   mode:'stdin' Legacy interactive scripts (pg_install_master.sh, druid, install_nifi2.sh,
+                httpd, opensearch*). Answers are piped in, in the order the
+                script asks. Use {{VAR}} tokens to pull values from task.env /
+                credentials into the answer lines.
+
+ NIFI 2.x  (install_nifi2.sh - standalone OR 2-node cluster, same script)
+   - 1 NiFi host  => STANDALONE.   2 NiFi hosts => CLUSTER (Node 1 = first host).
+   - The login password and the sensitive-props key are AUTO-GENERATED once
+     (secret group 'nifi', stored root-only on Node 1 / the standalone host) and
+     reused on every re-run, so the flow encryption key never changes.
+   - The CA, CA password, keystore/truststore passwords and ports are generated by
+     the script itself on Node 1 and packed into ONE bundle
+     (/tmp/nifi-cluster-bundle.tgz).
+   - The bundle is moved Node 1 -> Jenkins -> Node 2 by the PIPELINE (task 'relay'),
+     so no SSH trust between the two NiFi nodes is needed (the script is run with
+     AUTO_COPY_BUNDLE=false). Node 2 reads credentials, key and CA from the bundle;
+     nothing is typed. After Node 2 succeeds the bundle is deleted from Node 1
+     (Node 2 deletes its own copy).
+   - Ports to open BETWEEN the two NiFi nodes: 2181, 2888, 3888, 11443, 6342, 9443.
+
+ AUTO-GENERATED SHARED SECRETS (Airflow FERNET_KEY, WEBSERVER_SECRET_KEY, admin pw,
+ Redis password, NiFi admin password + sensitive-props key)
+   Declared under `secretGroups` in projectConfig(). Before any wave runs, the
+   pipeline SSHes to the group's store host, generates each missing key ONCE
+   (kept in a root-only file there, e.g. /etc/airflow-cluster/cluster.keys), reads
+   all values back, and injects the SAME values into every task that lists them
+   under `secrets:`. Re-runs reuse the stored values - a key is never
+   regenerated, so an existing cluster never breaks.
+   BACK UP those files: losing the FERNET_KEY / NiFi sensitive-props key means
+   losing the data they encrypt.
+
+ SECRETS
+   Never put passwords in this file. Map ENV_NAME -> Jenkins "Secret text"
+   credential ID under `creds:`. They are masked in the log, written to a
+   chmod 600 run.sh on the target, and deleted right after the run.
+
+ RUN-TIME PARAMETERS
+   ONLY       comma list of task ids or tags to run  (e.g. "airflow" or "spark-master,pg")
+              An id listed here runs even if the task has enabled:false.
+   SKIP       comma list of task ids or tags to skip
+   OVERRIDES  one per line:  KEY=VALUE  (applies to every task that defines KEY)
+                             taskId.KEY=VALUE  (one task only). Not for secrets.
+   DRY_RUN    validate + print the plan, touch no server
+   PARALLEL_HOSTS  untick to run every host one at a time
+
+ ASSUMPTIONS
+   - Passwordless sudo for SSH_USER on every target.
+   - Scripts live in ./scripts/ of the repo this job is configured for
+     ("Pipeline script from SCM").
+   - SSH private-key credential exists in Jenkins (SSH_CREDENTIALS_ID).
  =============================================================================
 */
 
@@ -67,64 +99,23 @@ pipeline {
     options {
         timestamps()
         disableConcurrentBuilds()
-        timeout(time: 3, unit: 'HOURS')
+        timeout(time: 6, unit: 'HOURS')
     }
 
     parameters {
-        string(name: 'SSH_USER', defaultValue: 'ubuntu', description: 'OS login user on all 4 target servers')
-        string(name: 'SSH_CREDENTIALS_ID', defaultValue: 'aws-ubuntu-ssh', description: 'Jenkins credential ID of the SSH private key (SSH Username with private key)')
-        string(name: 'APP_SERVER', defaultValue: '172.31.3.85', description: 'Apache httpd + OpenSearch Dashboards')
-        string(name: 'DI_SERVER', defaultValue: '172.31.10.254', description: 'NiFi standalone')
-        string(name: 'DB1_SERVER', defaultValue: '172.31.6.212', description: 'PostgreSQL + OpenSearch standalone')
-        string(name: 'DB2_SERVER', defaultValue: '172.31.11.87', description: 'Druid standalone')
-
-        booleanParam(name: 'DEPLOY_POSTGRES', defaultValue: true, description: 'Run pg_install_master.sh on DB1_SERVER')
-        booleanParam(name: 'DEPLOY_OPENSEARCH', defaultValue: true, description: 'Run opensearch_install.sh on DB1_SERVER')
-        booleanParam(name: 'DEPLOY_DRUID', defaultValue: true, description: 'Run druid_install.sh on DB2_SERVER')
-        booleanParam(name: 'DEPLOY_NIFI', defaultValue: true, description: 'Run install_nifi.sh on DI_SERVER')
-        booleanParam(name: 'DEPLOY_APACHE', defaultValue: true, description: 'Run install_apache_httpd.sh on APP_SERVER')
-        booleanParam(name: 'DEPLOY_DASHBOARDS', defaultValue: true, description: 'Run opensearch_dashboards_install.sh on APP_SERVER (needs OpenSearch already up on DB1_SERVER)')
-
-        string(name: 'PG_VERSION', defaultValue: '17.6', description: 'PostgreSQL version to build')
-        string(name: 'PG_BASE_DIR', defaultValue: '/data', description: 'Base install path on DB1_SERVER (never /, /etc, /home, etc.)')
-        string(name: 'PG_PORT', defaultValue: '5432', description: 'PostgreSQL port')
-        string(name: 'PG_SERVICE_USER', defaultValue: 'postgres', description: 'OS user PostgreSQL runs as')
-        string(name: 'PG_MASTER_IP', defaultValue: '172.31.6.212', description: 'listen_addresses IP (usually = DB1_SERVER)')
-        string(name: 'PG_REPLICA_IPS', defaultValue: '', description: 'Comma-separated replica IPs to pre-authorize (leave blank - standalone, no replica this run)')
-        booleanParam(name: 'PG_OPEN_CLIENT_ACCESS', defaultValue: false, description: 'Allow app clients from 0.0.0.0/0 with password auth')
-        string(name: 'PG_APP_DB', defaultValue: 'appdb', description: 'Initial application database name')
-
-        string(name: 'OS_BASE_DIR', defaultValue: '/data/opensearch', description: 'Base disk/dir on DB1_SERVER (do NOT use / — see prior disk-space incident)')
-        string(name: 'OS_CLUSTER_NAME', defaultValue: 'dev-01', description: 'OpenSearch cluster name')
-        password(name: 'OS_ADMIN_PASSWORD', defaultValue: '', description: 'Initial admin password (leave blank to use the script default EdxiP@ssword! — change this in production). Used for BOTH the OpenSearch stage and the Dashboards stage, so they always agree.')
-
-        string(name: 'OSD_BASE_DIR', defaultValue: '/data/opensearch-dashboards', description: 'Base disk/dir on APP_SERVER')
-        string(name: 'OSD_OS_HOST', defaultValue: '172.31.6.212', description: 'OpenSearch host Dashboards connects to (= DB1_SERVER)')
-        string(name: 'OSD_OS_PORT', defaultValue: '9200', description: 'OpenSearch HTTP port')
-        string(name: 'OSD_OS_USER', defaultValue: 'admin', description: 'OpenSearch admin username')
-        string(name: 'OSD_BIND_HOST', defaultValue: '0.0.0.0', description: 'Address Dashboards listens on')
-
-        string(name: 'DRUID_VOLUME_NAME', defaultValue: 'ausiytic', description: "Where to install Druid on DB2_SERVER: a full absolute path (e.g. '/data') installs directly into it; a bare name (e.g. 'ausiytic') nests under /opt; 'root' uses /opt on the root volume")
-        booleanParam(name: 'DRUID_RECONFIGURE', defaultValue: false, description: 'Pass --reconfigure to druid_install.sh. REQUIRED if this server was ever installed before with this script and you want to change ANY Druid setting below — otherwise the script silently reuses its saved /etc/druid-install/state.env and ignores every parameter here.')
-        booleanParam(name: 'DRUID_USE_POSTGRES', defaultValue: false, description: 'Use the PostgreSQL master above as Druid metadata store instead of embedded Derby')
-        string(name: 'DRUID_PG_PORT', defaultValue: '5432', description: 'Only used if DRUID_USE_POSTGRES is true')
-        string(name: 'DRUID_PG_DBNAME', defaultValue: 'druid', description: 'Only used if DRUID_USE_POSTGRES is true')
-        string(name: 'DRUID_PG_USER', defaultValue: 'druid', description: 'Only used if DRUID_USE_POSTGRES is true')
-        string(name: 'DRUID_PG_PASSWORD', defaultValue: '', description: 'Only used if DRUID_USE_POSTGRES is true')
-        booleanParam(name: 'DRUID_USE_AZURE', defaultValue: false, description: 'Use Azure Blob deep storage instead of local disk')
-        string(name: 'DRUID_AZURE_ACCOUNT', defaultValue: '', description: 'Only used if DRUID_USE_AZURE is true')
-        string(name: 'DRUID_AZURE_CONTAINER', defaultValue: 'druid', description: 'Only used if DRUID_USE_AZURE is true')
-        string(name: 'DRUID_AZURE_KEY', defaultValue: '', description: 'Only used if DRUID_USE_AZURE is true')
-        string(name: 'DRUID_ADMIN_PASSWORD', defaultValue: '', description: 'Blank = script auto-generates a random one')
-        string(name: 'DRUID_INTERNAL_PASSWORD', defaultValue: '', description: 'Blank = script auto-generates a random one')
-
-        string(name: 'NIFI_BASE_DIR', defaultValue: '/opt/ausiytic', description: "Base path on DI_SERVER, or / for root volume")
-        string(name: 'NIFI_ADMIN_USER', defaultValue: 'admin', description: 'NiFi UI login username')
-        string(name: 'NIFI_ADMIN_PASSWORD', defaultValue: '', description: 'NiFi UI login password, min 12 chars (REQUIRED — no safe default)')
-        choice(name: 'NIFI_PROXY_CHOICE', choices: ['2', '1', '3', '4'], description: 'nifi.web.proxy.host source: 1=Public IP 2=Private IP(default, intra-VPC) 3=Both 4=Custom hostname')
-        string(name: 'NIFI_CUSTOM_HOST', defaultValue: '', description: 'Only used if NIFI_PROXY_CHOICE=4')
-
-        string(name: 'HTTPD_BASE_DIR', defaultValue: '/opt/ausiytic', description: 'Base install directory on APP_SERVER')
+        string(name: 'SSH_USER', defaultValue: 'ubuntu', description: 'OS login user on all target servers')
+        string(name: 'SSH_CREDENTIALS_ID', defaultValue: 'aws-ubuntu-ssh', description: 'Jenkins credential ID (SSH Username with private key)')
+        text(name: 'SERVERS', defaultValue: '', description: 'Placement, one server per line:  host = service, service, ...   e.g.  10.0.1.23 = airflow-worker, spark-worker, chrome  (blank = use defaults / per-role params)')
+        string(name: 'ONLY', defaultValue: '', description: 'Task ids / tags to run (blank = every enabled task)')
+        string(name: 'SKIP', defaultValue: '', description: 'Task ids / tags to skip')
+        text(name: 'OVERRIDES', defaultValue: '', description: 'KEY=VALUE or taskId.KEY=VALUE per line. Non-secret values only.')
+        string(name: 'AIRFLOW_WORKERS', defaultValue: '', description: 'Airflow worker IPs, comma-separated, any number (blank = list in projectConfig()). e.g. 10.0.1.21,10.0.1.22,10.0.1.23')
+        string(name: 'SPARK_WORKERS', defaultValue: '', description: 'Spark worker IPs, comma-separated, any number (blank = list in projectConfig())')
+        string(name: 'KAFKA_HOSTS', defaultValue: '', description: 'Kafka server IPs, comma-separated, any number (blank = list in projectConfig()). Each gets its OWN single-node KRaft broker.')
+        string(name: 'CHROME_HOSTS', defaultValue: '', description: 'Servers that need Chrome + ChromeDriver, comma-separated, any number (blank = list in projectConfig())')
+        string(name: 'NIFI_HOSTS', defaultValue: '', description: 'NiFi server IPs: ONE = standalone, TWO = 2-node cluster (first = Node 1). Blank = default in projectConfig() (standalone).')
+        booleanParam(name: 'PARALLEL_HOSTS', defaultValue: true, description: 'Run different hosts of the same wave in parallel')
+        booleanParam(name: 'DRY_RUN', defaultValue: false, description: 'Validate and print plan only')
     }
 
     environment {
@@ -133,235 +124,33 @@ pipeline {
 
     stages {
 
-        stage('Validate required secrets') {
-            steps {
-                script {
-                    if (params.DEPLOY_NIFI && params.NIFI_ADMIN_PASSWORD.trim().length() < 12) {
-                        error "NIFI_ADMIN_PASSWORD must be at least 12 characters — the script itself enforces this and will hang re-prompting otherwise."
-                    }
-                    if (params.DEPLOY_DRUID && params.DRUID_USE_POSTGRES && !params.DRUID_PG_PASSWORD?.trim()) {
-                        error "DRUID_PG_PASSWORD is required when DRUID_USE_POSTGRES is true."
-                    }
-                    if (params.DEPLOY_DRUID && params.DRUID_USE_AZURE && (!params.DRUID_AZURE_ACCOUNT?.trim() || !params.DRUID_AZURE_KEY?.trim())) {
-                        error "DRUID_AZURE_ACCOUNT and DRUID_AZURE_KEY are required when DRUID_USE_AZURE is true."
-                    }
-                    if (params.DEPLOY_DASHBOARDS && !params.DEPLOY_OPENSEARCH) {
-                        echo "WARNING: DEPLOY_DASHBOARDS is true but DEPLOY_OPENSEARCH is false this run. Dashboards' pre-flight check will fail unless OpenSearch is ALREADY up and reachable on DB1_SERVER."
-                    }
-
-                    // Resolved once, used consistently by both the OpenSearch stage
-                    // and the Dashboards stage, instead of relying on a separate
-                    // Jenkins credential (see v2 fix #5 in the header comment).
-                    // OS_ADMIN_PASSWORD is a password-type parameter, so Jenkins hands it
-                    // back as a hudson.util.Secret object, not a plain String - Secret has
-                    // no .trim() method, so it must be converted to a String first.
-                    def osAdminPasswordPlain = params.OS_ADMIN_PASSWORD?.toString()
-                    RESOLVED_OS_ADMIN_PASSWORD = osAdminPasswordPlain?.trim() ?: 'EdxiP@ssword!'
-                }
-            }
-        }
-
         stage('Checkout') {
             steps {
                 checkout scm
-                sh "chmod +x ${SCRIPTS_DIR}/*.sh"
+                sh "chmod +x ${SCRIPTS_DIR}/*.sh || true"
             }
         }
 
-        stage('DB1: PostgreSQL master') {
-            when { expression { params.DEPLOY_POSTGRES } }
+        stage('Plan & validate') {
             steps {
                 script {
-                    // Order of reads in pg_install_master.sh:
-                    // PG_VERSION -> BASE_DIR -> PG_PORT -> SERVICE_USER -> MASTER_IP
-                    // -> REPLICA_IPS_RAW -> OPEN_CLIENT_ACCESS -> APP_DB
-                    def answers = [
-                        params.PG_VERSION,
-                        params.PG_BASE_DIR,
-                        params.PG_PORT,
-                        params.PG_SERVICE_USER,
-                        params.PG_MASTER_IP,
-                        params.PG_REPLICA_IPS,
-                        (params.PG_OPEN_CLIENT_ACCESS ? 'y' : 'N'),
-                        params.PG_APP_DB
-                    ].join('\n') + '\n'
-                    runRemoteScript(params.DB1_SERVER, 'pg_install_master.sh', answers)
-                }
-            }
-        }
-
-        stage('DB1: OpenSearch') {
-            when { expression { params.DEPLOY_OPENSEARCH } }
-            steps {
-                script {
-                    // opensearch_install.sh supports --base-dir / --cluster-name flags,
-                    // which skip those two prompts entirely. The final
-                    // "Confirm and continue? [Y/n]" prompt still always fires.
-                    //
-                    // Env var is passed via `sudo -n env VAR=value bash script` rather
-                    // than `sudo -n VAR=value bash script` — the latter's propagation
-                    // depends on the sudoers env_keep/setenv policy and can silently
-                    // drop the variable; `env` sets it unconditionally for the process
-                    // it execs (see v2 fix #5 in the header comment).
-                    def flags = "--base-dir '${params.OS_BASE_DIR}' --cluster-name '${params.OS_CLUSTER_NAME}'"
-                    def envPrefix = "env OPENSEARCH_INITIAL_ADMIN_PASSWORD='${RESOLVED_OS_ADMIN_PASSWORD}' "
-                    def answers = "Y\n"
-                    runRemoteScript(params.DB1_SERVER, 'opensearch_install.sh', answers, flags, envPrefix)
-                }
-            }
-        }
-
-        stage('DB2: Pre-flight - ensure Druid volume directory exists') {
-            when { expression { params.DEPLOY_DRUID && params.DRUID_VOLUME_NAME?.trim() && params.DRUID_VOLUME_NAME.trim() != 'root' } }
-            steps {
-                script {
-                    // druid_install.sh's prompt_volume() loops forever re-reading stdin
-                    // if the resolved BASE_PATH doesn't already exist as a directory,
-                    // which desyncs every answer piped in after it (see v2 fix #2).
-                    // Resolve the path the SAME way druid_install.sh v6 does, so the
-                    // directory we pre-create is the one the script will actually use:
-                    //   - starts with '/'  -> absolute path, used as-is (v2 fix #6)
-                    //   - otherwise        -> bare name, nested under /opt
-                    def resolveDruidBasePath = { String raw ->
-                        def trimmed = raw.trim().replaceAll('/+$', '')
-                        if (trimmed.startsWith('/')) {
-                            return trimmed
-                        }
-                        return "/opt/${trimmed}"
+                    def plan = buildPlan()
+                    if (plan.isEmpty()) {
+                        error 'No tasks selected (check enabled flags / ONLY / SKIP).'
                     }
-                    def volDir = resolveDruidBasePath(params.DRUID_VOLUME_NAME)
-                    sshRunCommand(params.DB2_SERVER, "sudo -n mkdir -p '${volDir}'")
-                }
-            }
-        }
-
-        stage('DB2: Druid') {
-            when { expression { params.DEPLOY_DRUID } }
-            steps {
-                script {
-                    // Order of reads in druid_install.sh (only asked on a fresh
-                    // state.env, i.e. first run or --reconfigure):
-                    // prompt_volume: VOLUME_NAME_RAW
-                    // prompt_druid_config:
-                    //   PostgreSQL host (blank = skip -> Derby)
-                    //     [if non-blank: port, dbname, user, password]
-                    //   Azure storage account (blank = skip -> local disk)
-                    //     [if non-blank: container, key]
-                    //   admin password (blank = auto-generate)
-                    //   internal client password (blank = auto-generate)
-                    //
-                    // NOTE: these prompts (and this stdin block) are SKIPPED by the
-                    // script entirely if it already has a saved state.env from a
-                    // prior run on this server, UNLESS --reconfigure is passed (see
-                    // DRUID_RECONFIGURE param / v2 fix #1). The stdin below is inert
-                    // but harmless in that case.
-                    def lines = [params.DRUID_VOLUME_NAME]
-                    if (params.DRUID_USE_POSTGRES) {
-                        lines += [params.DB1_SERVER, params.DRUID_PG_PORT, params.DRUID_PG_DBNAME, params.DRUID_PG_USER, params.DRUID_PG_PASSWORD]
-                    } else {
-                        lines += ['']
-                    }
-                    if (params.DRUID_USE_AZURE) {
-                        lines += [params.DRUID_AZURE_ACCOUNT, params.DRUID_AZURE_CONTAINER, params.DRUID_AZURE_KEY]
-                    } else {
-                        lines += ['']
-                    }
-                    lines += [params.DRUID_ADMIN_PASSWORD, params.DRUID_INTERNAL_PASSWORD]
-                    def answers = lines.join('\n') + '\n'
-                    def extraArgs = params.DRUID_RECONFIGURE ? '--reconfigure' : ''
-                    runRemoteScript(params.DB2_SERVER, 'druid_install.sh', answers, extraArgs)
-                }
-            }
-        }
-
-        stage('DI: Pre-flight - ensure NiFi base directory exists') {
-            when { expression { params.DEPLOY_NIFI && params.NIFI_BASE_DIR?.trim() && params.NIFI_BASE_DIR.trim() != '/' } }
-            steps {
-                script {
-                    // install_nifi.sh's prompt_disk() hard-dies immediately if the
-                    // path doesn't already exist (it never creates it) - see v2 fix #3.
-                    sshRunCommand(params.DI_SERVER, "sudo -n mkdir -p '${params.NIFI_BASE_DIR.trim()}'")
-                }
-            }
-        }
-
-        stage('DI: NiFi') {
-            when { expression { params.DEPLOY_NIFI } }
-            steps {
-                script {
-                    // Order of reads in install_nifi.sh:
-                    // prompt_disk: DISK_MOUNT
-                    // prompt_credentials: NIFI_ADMIN_USER -> NIFI_ADMIN_PASS -> confirm
-                    // prompt_proxy_host: choice[1-4] -> (custom_host only if 4)
-                    def lines = [
-                        params.NIFI_BASE_DIR,
-                        params.NIFI_ADMIN_USER,
-                        params.NIFI_ADMIN_PASSWORD,
-                        params.NIFI_ADMIN_PASSWORD,
-                        params.NIFI_PROXY_CHOICE
-                    ]
-                    if (params.NIFI_PROXY_CHOICE == '4') {
-                        lines += [params.NIFI_CUSTOM_HOST]
-                    }
-                    def answers = lines.join('\n') + '\n'
-                    runRemoteScript(params.DI_SERVER, 'install_nifi.sh', answers)
-                }
-            }
-        }
-
-        stage('APP: Apache httpd') {
-            when { expression { params.DEPLOY_APACHE } }
-            steps {
-                script {
-                    // Order of reads in install_apache_httpd.sh: BASE_DIR -> CONFIRM[y/N]
-                    def answers = "${params.HTTPD_BASE_DIR}\ny\n"
-                    runRemoteScript(params.APP_SERVER, 'install_apache_httpd.sh', answers)
-                }
-            }
-        }
-
-        stage('APP: Fetch OpenSearch root CA for Dashboards TLS trust') {
-            when { expression { params.DEPLOY_DASHBOARDS } }
-            steps {
-                script {
-                    // opensearch_dashboards_install.sh can only auto-discover the CA
-                    // on its OWN filesystem, but Dashboards runs on APP_SERVER while
-                    // the CA was generated on DB1_SERVER (see v2 fix #4). Copy it
-                    // across via the Jenkins agent. Non-fatal if it's not there yet
-                    // (e.g. OpenSearch was installed by an older run of this pipeline,
-                    // or on a schedule where DEPLOY_OPENSEARCH is false this time) -
-                    // the Dashboards script itself just falls back to unverified TLS
-                    // with a warning in that case, same as before this fix.
-                    def remoteCaPath = "${params.OS_BASE_DIR}/apps/opensearch/binaries/config/root-ca.pem"
-                    ROOT_CA_FETCHED = fetchRemoteFileThenPush(
-                        params.DB1_SERVER, remoteCaPath,
-                        params.APP_SERVER, '/tmp/opensearch-root-ca.pem'
-                    )
-                    if (!ROOT_CA_FETCHED) {
-                        echo "WARNING: could not fetch OpenSearch's root-ca.pem from DB1_SERVER (${remoteCaPath}). Dashboards will fall back to unverified TLS (opensearch.ssl.verificationMode: none)."
+                    def errors = validatePlan(plan)
+                    printPlan(plan)
+                    if (!errors.isEmpty()) {
+                        error "Plan validation failed:\n - " + errors.join("\n - ")
                     }
                 }
             }
         }
 
-        stage('APP: OpenSearch Dashboards') {
-            when { expression { params.DEPLOY_DASHBOARDS } }
+        stage('Deploy') {
             steps {
                 script {
-                    // All connection details are passed as flags, so step_prompt_inputs()
-                    // skips straight to its summary + "Confirm and continue? [Y/n]" prompt,
-                    // which is the ONLY thing left on stdin.
-                    def flags = "--base-dir '${params.OSD_BASE_DIR}' " +
-                                "--opensearch-host '${params.OSD_OS_HOST}' " +
-                                "--opensearch-port '${params.OSD_OS_PORT}' " +
-                                "--opensearch-user '${params.OSD_OS_USER}' " +
-                                "--opensearch-password '${RESOLVED_OS_ADMIN_PASSWORD}' " +
-                                "--bind-host '${params.OSD_BIND_HOST}'"
-                    if (ROOT_CA_FETCHED) {
-                        flags += " --opensearch-root-ca '/tmp/opensearch-root-ca.pem'"
-                    }
-                    def answers = "Y\n"
-                    runRemoteScript(params.APP_SERVER, 'opensearch_dashboards_install.sh', answers, flags)
+                    executePlan(buildPlan(), params.DRY_RUN, params.PARALLEL_HOSTS)
                 }
             }
         }
@@ -369,130 +158,1011 @@ pipeline {
 
     post {
         always {
-            echo 'Deployment run finished — see per-stage logs above for each server.'
+            sh 'rm -rf .deploy || true'
+            echo 'Deployment run finished - see per-task logs above.'
         }
     }
 }
 
-// Set by the "Validate required secrets" and "APP: Fetch OpenSearch root CA"
-// stages, read by later stages. Declared at script scope (outside pipeline{})
-// so the same value persists across stages.
-def RESOLVED_OS_ADMIN_PASSWORD = null
-def ROOT_CA_FETCHED = false
+// =============================================================================
+//  PROJECT CONFIG  -  the only part you edit per project
+// =============================================================================
+def projectConfig() {
 
-// -----------------------------------------------------------------------
-// Copies a script to the target host and runs it as root with the given
-// answers piped in over stdin, inside an sshagent session so the private
-// key never touches disk on the Jenkins agent.
-// -----------------------------------------------------------------------
-def runRemoteScript(String host,
-                    String scriptName,
-                    String stdinAnswers,
-                    String extraFlags = '',
-                    String remoteEnvPrefix = '') {
+    // ---- 1. Servers: logical name -> IP/hostname ---------------------------
+    // Add / remove lines freely. Use CHANGE_ME for not-yet-known hosts.
+    def P = parsePlacement(params.SERVERS)       // service -> [hosts], from the SERVERS parameter
+    // Default host per service is used only when SERVERS does not place that service.
+    def S = [
+        PG           : hostOf(P, 'pg',               '172.31.6.212'),
+        OPENSEARCH   : hostOf(P, 'opensearch',       '172.31.6.212'),
+        DRUID        : hostOf(P, 'druid',            '172.31.11.87'),
+        HTTPD        : hostOf(P, 'httpd',            '172.31.3.85'),
+        DASHBOARDS   : hostOf(P, 'dashboards',       '172.31.3.85'),
 
-    withCredentials([
-        sshUserPrivateKey(
-            credentialsId: params.SSH_CREDENTIALS_ID,
-            keyFileVariable: 'SSH_KEY',
-            usernameVariable: 'SSH_USER_CRED'
+        AIRFLOW_CTRL : hostOf(P, 'airflow-control',  'CHANGE_ME'),
+        REDIS        : hostOf(P, 'redis',            'CHANGE_ME'),   // installed by the 'redis' task; or an existing Redis (see REDIS_MANAGED)
+        SPARK_MASTER : hostOf(P, 'spark-master',     'CHANGE_ME'),
+        SPARK_SINGLE : hostOf(P, 'spark-standalone', 'CHANGE_ME'),   // only for the single-node standalone option
+        POLARIS      : hostOf(P, 'polaris',          'CHANGE_ME'),
+        HIVE         : hostOf(P, 'hive',             'CHANGE_ME'),   // Hadoop client + Hive Metastore
+        PRESTO       : hostOf(P, 'presto',           'CHANGE_ME')    // Presto coordinator+worker (single node)
+    ]
+
+    // Worker fleets: one entry per node. Any number, any project.
+    // The build parameters AIRFLOW_WORKERS / SPARK_WORKERS (comma-separated) win if filled in;
+    // otherwise these defaults are used. Any count works: 1, 5, 7, 8, 20 ...
+    def AIRFLOW_WORKER_HOSTS = P['airflow-worker'] ?: pickHosts(params.AIRFLOW_WORKERS, ['CHANGE_ME'])   // e.g. ['10.0.1.21', '10.0.1.22', ...]
+    def SPARK_WORKER_HOSTS   = P['spark-worker'] ?: pickHosts(params.SPARK_WORKERS, ['CHANGE_ME'])   // e.g. ['10.0.2.31', '10.0.2.32', ...]
+    def KAFKA_HOSTS          = P['kafka'] ?: pickHosts(params.KAFKA_HOSTS, ['CHANGE_ME'])   // one independent single-node broker per host
+    def CHROME_HOSTS         = P['chrome'] ?: pickHosts(params.CHROME_HOSTS, ['CHANGE_ME'])   // any servers that run Selenium/headless browsers
+    // NiFi: 1 host = standalone, 2 hosts = 2-node cluster (first = Node 1). Default = the old single NiFi server.
+    def NIFI_HOSTS           = P['nifi'] ?: pickHosts(params.NIFI_HOSTS, ['172.31.10.254'])
+    if (NIFI_HOSTS.size() > 2) {
+        error "NiFi supports 1 host (standalone) or 2 hosts (cluster), but ${NIFI_HOSTS.size()} were given: ${NIFI_HOSTS.join(', ')}"
+    }
+
+    // ---- 2. Shared values (defined once, used by several tasks) -------------
+    def OS_BASE  = '/data/opensearch'
+    def OS_CRED  = 'opensearch-admin-password'          // Jenkins Secret-text credential ID
+
+    def AIRFLOW = [
+        BASE_DIR        : '/opt/ausiytic',
+        SERVICE_USER    : 'airflow',
+        PYTHON_VERSION  : '3.10.10',
+        AIRFLOW_VERSION : '3.1.2',                      // MUST be the same on control + workers
+        AIRFLOW_EXTRAS  : '',
+        DB_HOST         : S.PG,                        // Postgres from the pg task below
+        DB_PORT         : '5432',
+        DB_NAME         : 'airflow',                    // database + user must already exist
+        DB_USER         : 'airflow',
+        REDIS_HOST      : S.REDIS,
+        REDIS_PORT      : '6379',
+        REDIS_DB        : '0',
+        DAGS_FOLDER     : '/mnt/shared/airflow-dags'    // same shared mount on EVERY airflow node
+    ]
+    // Only EXTERNAL secrets stay as Jenkins credentials (the DB password must match
+    // the Postgres user that already exists). Fernet/webserver/admin are auto-generated below.
+    def AIRFLOW_CREDS = [
+        DB_PASSWORD          : 'airflow-db-password'
+        // REDIS_PASSWORD    : 'airflow-redis-password',   // uncomment if Redis needs auth
+    ]
+    def AIRFLOW_REQUIRED = ['DB_HOST', 'DB_PASSWORD', 'REDIS_HOST', 'FERNET_KEY', 'DAGS_FOLDER']
+
+    // true  = Redis is installed by THIS pipeline ('redis' task): its password is auto-generated once,
+    //         stored on the Redis server, and given to the redis task AND every Airflow node.
+    // false = Redis already exists elsewhere: Airflow gets no generated Redis password
+    //         (add REDIS_PASSWORD under AIRFLOW_CREDS above if that Redis requires auth).
+    def REDIS_MANAGED = true
+    def redisSecret = REDIS_MANAGED ? [[group: 'redis', keys: ['REDIS_PASSWORD']]] : []
+
+    // Generated once, stored on the control node, shared with every airflow task.
+    // generator types: fernet | hex32 | password
+    def SECRET_GROUPS = [
+        airflow: [
+            host: S.AIRFLOW_CTRL,
+            path: '/etc/airflow-cluster/cluster.keys',
+            keys: [FERNET_KEY: 'fernet', WEBSERVER_SECRET_KEY: 'hex32', ADMIN_PASSWORD: 'password']
+        ],
+        redis: [
+            host: S.REDIS,
+            path: '/etc/redis-cluster/cluster.keys',
+            keys: [REDIS_PASSWORD: 'password']
+        ],
+        // NiFi login password + sensitive-props key: generated once on Node 1 (or the standalone host).
+        // Node 2 never needs them: it reads them from the bundle Node 1 creates.
+        nifi: [
+            host: NIFI_HOSTS[0],
+            path: '/etc/nifi-cluster/cluster.keys',
+            keys: [NIFI_ADMIN_PASSWORD: 'password', SENSITIVE_PROPS_KEY: 'password']
+        ]
+    ]
+
+    def SPARK = [
+        SPARK_VERSION  : '4.0.3',
+        HADOOP_VARIANT : 'hadoop3',
+        BASE_DIR       : '/opt/ausiytic',
+        SERVICE_USER   : 'spark',
+        MASTER_PORT    : '7077'
+    ]
+
+    def DRUID = [
+        VOLUME_NAME : 'ausiytic',       // '/data' = absolute; 'name' = under /opt; 'root' = /opt on root volume
+        RECONFIGURE : false,            // true => --reconfigure (needed to change settings on an already-installed server)
+        USE_PG      : false,
+        PG_PORT     : '5432', PG_DBNAME: 'druid', PG_USER: 'druid',
+        USE_AZURE   : false,
+        AZ_ACCOUNT  : '', AZ_CONTAINER: 'druid'
+    ]
+
+    def tasks = []
+
+    // =========================================================================
+    //  EXISTING INSTALLS
+    // =========================================================================
+
+    // ---- DB1: PostgreSQL ----------------------------------------------------
+    // stdin order: PG_VERSION, BASE_DIR, PG_PORT, SERVICE_USER, MASTER_IP,
+    //              REPLICA_IPS, OPEN_CLIENT_ACCESS, APP_DB
+    tasks << newTask(
+        id: 'pg', service: 'pg', tags: ['db', 'postgres'], wave: 1, host: S.PG,
+        script: 'pg_install_master.sh', mode: 'stdin',
+        env: [PG_VERSION: '17.6', PG_BASE_DIR: '/data', PG_PORT: '5432', PG_SERVICE_USER: 'postgres',
+              PG_MASTER_IP: S.PG, PG_REPLICA_IPS: '', PG_OPEN_CLIENT_ACCESS: 'N', PG_APP_DB: 'appdb'],
+        stdin: ['{{PG_VERSION}}', '{{PG_BASE_DIR}}', '{{PG_PORT}}', '{{PG_SERVICE_USER}}',
+                '{{PG_MASTER_IP}}', '{{PG_REPLICA_IPS}}', '{{PG_OPEN_CLIENT_ACCESS}}', '{{PG_APP_DB}}']
+    )
+
+    // ---- DB1: OpenSearch (same host as pg => runs AFTER it, sequentially) ---
+    tasks << newTask(
+        id: 'opensearch', service: 'opensearch', tags: ['db', 'opensearch'], wave: 1, host: S.OPENSEARCH,
+        script: 'opensearch_install.sh', mode: 'stdin',
+        creds: [OPENSEARCH_INITIAL_ADMIN_PASSWORD: OS_CRED],
+        exportEnv: ['OPENSEARCH_INITIAL_ADMIN_PASSWORD'],
+        flags: "--base-dir '${OS_BASE}' --cluster-name 'dev-01'",
+        stdin: ['Y']                                         // "Confirm and continue? [Y/n]"
+    )
+
+    // ---- DB2: Druid -----------------------------------------------------------
+    // stdin order (only read on first run / --reconfigure):
+    //   VOLUME_NAME, PG host(+port,db,user,pw if set), Azure acct(+container,key if set),
+    //   admin password, internal password
+    def druidLines = ['{{DRUID_VOLUME_NAME}}']
+    def druidCreds = [:]
+    if (DRUID.USE_PG) {
+        druidLines += [S.PG, DRUID.PG_PORT, DRUID.PG_DBNAME, DRUID.PG_USER, '{{DRUID_PG_PASSWORD}}']
+        druidCreds['DRUID_PG_PASSWORD'] = 'druid-pg-password'
+    } else {
+        druidLines += ['']
+    }
+    if (DRUID.USE_AZURE) {
+        druidLines += [DRUID.AZ_ACCOUNT, DRUID.AZ_CONTAINER, '{{DRUID_AZURE_KEY}}']
+        druidCreds['DRUID_AZURE_KEY'] = 'druid-azure-key'
+    } else {
+        druidLines += ['']
+    }
+    druidLines += ['', '']                                   // blank = script auto-generates both passwords
+    tasks << newTask(
+        id: 'druid', service: 'druid', tags: ['db', 'druid'], wave: 2, host: S.DRUID,
+        script: 'druid_install.sh', mode: 'stdin',
+        env: [DRUID_VOLUME_NAME: DRUID.VOLUME_NAME],
+        creds: druidCreds,
+        flags: DRUID.RECONFIGURE ? '--reconfigure' : '',
+        stdin: druidLines,
+        preDirs: druidPreDirs(DRUID.VOLUME_NAME)             // prompt_volume() loops forever if dir is missing
+    )
+
+    // =========================================================================
+    //  DI: APACHE NIFI 2.x  -  install_nifi2.sh   (STANDALONE or 2-NODE CLUSTER)
+    //
+    //  1 host in NIFI_HOSTS  => standalone    (task id: nifi)
+    //  2 hosts               => cluster       (task ids: nifi-1 = Node 1 wave 1, nifi-2 = Node 2 wave 2)
+    //
+    //  Secrets: NIFI_ADMIN_PASSWORD + SENSITIVE_PROPS_KEY are auto-generated once (secret group 'nifi').
+    //  Everything else (CA, CA password, keystore passwords) is generated by the script on Node 1 and
+    //  travels in /tmp/nifi-cluster-bundle.tgz. The pipeline relays that bundle Node 1 -> Jenkins -> Node 2
+    //  (relay:), so the script runs with AUTO_COPY_BUNDLE=false and never needs node-to-node SSH.
+    //
+    //  stdin order (AUTO_COPY_BUNDLE=false => no SSH questions are asked):
+    //    standalone : mode(1), BASE_DIR, user, pass, pass(confirm), this-address, extra-proxy-host
+    //    cluster N1 : mode(2), BASE_DIR, node(1), this-address, peer-address, extra-proxy-host, user, pass, pass
+    //    cluster N2 : mode(2), BASE_DIR, node(2), this-address, peer-address, extra-proxy-host
+    //  Ports to open between the two nodes: 2181, 2888, 3888, 11443, 6342, 9443.
+    // =========================================================================
+    def NIFI_BUNDLE   = '/tmp/nifi-cluster-bundle.tgz'
+    def NIFI_CLUSTER  = (NIFI_HOSTS.size() == 2)
+    def NIFI_EXPORT   = ['NIFI_VERSION', 'NIFI_HTTPS_PORT', 'NIFI_XMS', 'NIFI_XMX',
+                         'NIFI_SERVICE_USER', 'NIFI_SERVICE_GROUP', 'AUTO_COPY_BUNDLE']
+    def nifiSecrets   = [[group: 'nifi', keys: ['NIFI_ADMIN_PASSWORD', 'SENSITIVE_PROPS_KEY']]]
+
+    for (int i = 0; i < NIFI_HOSTS.size(); i++) {
+        def nHost = NIFI_HOSTS[i]
+        def nPeer = NIFI_CLUSTER ? NIFI_HOSTS[1 - i] : ''
+        def nEnv = [NIFI_BASE_DIR: '/opt/ausiytic', NIFI_ADMIN_USER: 'admin',
+                    NIFI_VERSION: '2.9.0', NIFI_HTTPS_PORT: '9443', NIFI_XMS: '1g', NIFI_XMX: '1g',
+                    NIFI_SERVICE_USER: 'root', NIFI_SERVICE_GROUP: 'root',
+                    NIFI_THIS_ADDR: nHost, NIFI_PEER_ADDR: nPeer, NIFI_EXTRA_PROXY_HOST: '',
+                    AUTO_COPY_BUNDLE: 'false']          // the pipeline moves the bundle, not the script
+
+        if (!NIFI_CLUSTER) {
+            // ---- standalone ----
+            tasks << newTask(
+                id: 'nifi', service: 'nifi', tags: ['di', 'nifi'], wave: 1, host: nHost,
+                script: 'install_nifi2.sh', mode: 'stdin', timeoutMin: 45,
+                env: nEnv, secrets: nifiSecrets,
+                required: ['NIFI_BASE_DIR', 'NIFI_ADMIN_USER', 'NIFI_ADMIN_PASSWORD', 'SENSITIVE_PROPS_KEY'],
+                minLen: [NIFI_ADMIN_PASSWORD: 12],
+                exportEnv: NIFI_EXPORT + ['SENSITIVE_PROPS_KEY'],
+                stdin: ['1', '{{NIFI_BASE_DIR}}', '{{NIFI_ADMIN_USER}}', '{{NIFI_ADMIN_PASSWORD}}',
+                        '{{NIFI_ADMIN_PASSWORD}}', '{{NIFI_THIS_ADDR}}', '{{NIFI_EXTRA_PROXY_HOST}}'],
+                preDirs: ['{{NIFI_BASE_DIR}}']              // prompt_disk() dies if the path is missing
+            )
+        } else if (i == 0) {
+            // ---- cluster Node 1: generates the CA + bundle ----
+            tasks << newTask(
+                id: 'nifi-1', service: 'nifi', tags: ['di', 'nifi', 'nifi-cluster'], wave: 1, host: nHost,
+                script: 'install_nifi2.sh', mode: 'stdin', timeoutMin: 45,
+                env: nEnv, secrets: nifiSecrets,
+                required: ['NIFI_BASE_DIR', 'NIFI_ADMIN_USER', 'NIFI_ADMIN_PASSWORD', 'SENSITIVE_PROPS_KEY',
+                           'NIFI_THIS_ADDR', 'NIFI_PEER_ADDR'],
+                minLen: [NIFI_ADMIN_PASSWORD: 12],
+                exportEnv: NIFI_EXPORT + ['SENSITIVE_PROPS_KEY'],
+                stdin: ['2', '{{NIFI_BASE_DIR}}', '1', '{{NIFI_THIS_ADDR}}', '{{NIFI_PEER_ADDR}}',
+                        '{{NIFI_EXTRA_PROXY_HOST}}', '{{NIFI_ADMIN_USER}}', '{{NIFI_ADMIN_PASSWORD}}',
+                        '{{NIFI_ADMIN_PASSWORD}}'],
+                preDirs: ['{{NIFI_BASE_DIR}}']
+            )
+        } else {
+            // ---- cluster Node 2: bundle is relayed from Node 1 right before the script starts ----
+            tasks << newTask(
+                id: 'nifi-2', service: 'nifi', tags: ['di', 'nifi', 'nifi-cluster'], wave: 2, host: nHost,
+                script: 'install_nifi2.sh', mode: 'stdin', timeoutMin: 45,
+                env: nEnv,
+                required: ['NIFI_BASE_DIR', 'NIFI_THIS_ADDR', 'NIFI_PEER_ADDR'],
+                exportEnv: NIFI_EXPORT,
+                stdin: ['2', '{{NIFI_BASE_DIR}}', '2', '{{NIFI_THIS_ADDR}}', '{{NIFI_PEER_ADDR}}',
+                        '{{NIFI_EXTRA_PROXY_HOST}}'],
+                preDirs: ['{{NIFI_BASE_DIR}}'],
+                relay: [[fromHost: NIFI_HOSTS[0], fromPath: NIFI_BUNDLE, toPath: NIFI_BUNDLE]],
+                cleanupRemote: [[host: NIFI_HOSTS[0], path: NIFI_BUNDLE]]     // remove the secrets bundle from Node 1 afterwards
+            )
+        }
+    }
+
+    // ---- APP: Apache httpd ---------------------------------------------------------
+    tasks << newTask(
+        id: 'httpd', service: 'httpd', tags: ['app', 'httpd'], wave: 1, host: S.HTTPD,
+        script: 'install_apache_httpd.sh', mode: 'stdin',
+        env: [HTTPD_BASE_DIR: '/opt/ausiytic'],
+        stdin: ['{{HTTPD_BASE_DIR}}', 'y']
+    )
+
+    // ---- APP: OpenSearch Dashboards (needs OpenSearch up => wave 2) ------------------
+    tasks << newTask(
+        id: 'dashboards', service: 'dashboards', tags: ['app', 'opensearch'], wave: 2, host: S.DASHBOARDS,
+        script: 'opensearch_dashboards_install.sh', mode: 'stdin',
+        creds: [OS_ADMIN_PASSWORD: OS_CRED],
+        exportEnv: ['OS_ADMIN_PASSWORD'],
+        // The password flag references the exported env var (resolved by the remote shell).
+        flags: "--base-dir '/data/opensearch-dashboards' --opensearch-host '${S.OPENSEARCH}' --opensearch-port '9200' " +
+               "--opensearch-user 'admin' --opensearch-password \"\$OS_ADMIN_PASSWORD\" --bind-host '0.0.0.0'",
+        // Dashboards runs here but OpenSearch's CA lives on DB1 -> copy it across (non-fatal if missing)
+        fetch: [[fromHost: S.OPENSEARCH, fromPath: "${OS_BASE}/apps/opensearch/binaries/config/root-ca.pem",
+                 toPath: '/tmp/opensearch-root-ca.pem',
+                 flag: "--opensearch-root-ca '/tmp/opensearch-root-ca.pem'"]],
+        stdin: ['Y']
+    )
+
+    // =========================================================================
+    //  NEW: HADOOP 3.4.1 (client + S3A) + HIVE 3.1.3 METASTORE  -  install_hadoop_hive.sh
+    //  mode:'env' - the script reads every answer from environment variables (ASSUME_YES=y skips the prompt).
+    //  PREREQUISITES (the script does NOT create them):
+    //    - a PostgreSQL database + user for the metastore (HIVE_DB_NAME / HIVE_DB_USER below)
+    //    - pg_hba.conf / listen_addresses on the PG host must allow the Hive host
+    //    - Jenkins Secret-text credential 'hive-db-password' = that PostgreSQL user's password
+    //  Wave 2: PostgreSQL (wave 1) must already be up. Metastore listens on HIVE_METASTORE_PORT.
+    //  Warehouse: file:// local path by default; for S3 use e.g.  hive.HIVE_WAREHOUSE_DIR=s3a://bucket/warehouse
+    // =========================================================================
+    tasks << newTask(
+        id: 'hive', service: 'hive', tags: ['bigdata', 'hive'], wave: 2, host: S.HIVE, enabled: false,
+        script: 'install_hadoop_hive.sh', mode: 'env', timeoutMin: 60,
+        env: [BASE_DIR: '/opt/ausiytic', SVC_USER: params.SSH_USER,
+              HIVE_DB_HOST: S.PG, HIVE_DB_PORT: '5432', HIVE_DB_NAME: 'hive', HIVE_DB_USER: 'hive',
+              HIVE_METASTORE_PORT: '9083',
+              HIVE_WAREHOUSE_DIR: 'file:///opt/ausiytic/apps/hive/data/warehouse',
+              ASSUME_YES: 'y'],
+        creds: [HIVE_DB_PASSWORD: 'hive-db-password'],
+        required: ['BASE_DIR', 'SVC_USER', 'HIVE_DB_HOST', 'HIVE_DB_NAME', 'HIVE_DB_USER', 'HIVE_DB_PASSWORD'],
+        preDirs: ['/opt/ausiytic']
+    )
+
+    // =========================================================================
+    //  NEW: PRESTO 0.294  -  install_presto.sh   (single node coordinator + worker, Java 8)
+    //  mode:'env' - answers come from environment variables (ASSUME_YES=y skips the prompt).
+    //  Wave 3: the Hive Metastore (wave 2) must be up. HIVE_METASTORE_URI points at the 'hive' host;
+    //  if Hive is NOT part of this run, set it:  HIVE_METASTORE_URI=thrift://<host>:9083  (OVERRIDES).
+    //  The tarball comes from Maven Central. If the host cannot reach it, point at an internal mirror:
+    //      PRESTO_URL=https://your-mirror/presto-server-0.294.tar.gz      (OVERRIDES)
+    //  Password auth is off by default (ENABLE_PASSWORD_AUTH=n). Query memory: per-node must be <= 70% of heap.
+    // =========================================================================
+    tasks << newTask(
+        id: 'presto', service: 'presto', tags: ['bigdata', 'presto'], wave: 3, host: S.PRESTO, enabled: false,
+        script: 'install_presto.sh', mode: 'env', timeoutMin: 60,
+        env: [BASE_DIR: '/opt/ausiytic', SVC_USER: params.SSH_USER,
+              PRESTO_DISCOVERY_HOST: S.PRESTO, PRESTO_HTTP_PORT: '8585',
+              PRESTO_HEAP: '2G', PRESTO_QUERY_MAX_MEMORY: '1GB',
+              HIVE_METASTORE_URI: "thrift://${S.HIVE}:9083",
+              ENABLE_PASSWORD_AUTH: 'n', PRESTO_URL: '', ASSUME_YES: 'y'],
+        required: ['BASE_DIR', 'SVC_USER', 'PRESTO_DISCOVERY_HOST', 'HIVE_METASTORE_URI'],
+        patterns: [HIVE_METASTORE_URI: '^thrift://[^\\s]+$'],
+        preDirs: ['/opt/ausiytic']
+    )
+
+    // =========================================================================
+    //  NEW: APACHE AIRFLOW (CeleryExecutor cluster)
+    //  Prereqs (not installed by these scripts): Postgres DB+user for airflow,
+    //  a reachable Redis, and the shared DAGs mount on every airflow node.
+    //  Flip enabled:true after replacing the CHANGE_ME hosts above.
+    // =========================================================================
+    def airflowSupport = ['airflow_cluster_common.sh']       // sourced by control + worker scripts
+
+    def ctrlEnv = [:]
+    ctrlEnv.putAll(AIRFLOW)
+    ctrlEnv.putAll([API_PORT: '8080', JWT_ISSUER: 'airflow-api', ADMIN_USERNAME: 'admin',
+                    INSTALL_FLOWER: '0', FLOWER_PORT: '5555'])
+
+    tasks << newTask(
+        id: 'airflow-control', service: 'airflow-control', tags: ['airflow'], wave: 3, host: S.AIRFLOW_CTRL, enabled: false,
+        script: 'airflow_cluster_scheduler.sh', files: airflowSupport, timeoutMin: 90,
+        env: ctrlEnv, creds: AIRFLOW_CREDS,
+        secrets: [[group: 'airflow', keys: ['FERNET_KEY', 'WEBSERVER_SECRET_KEY', 'ADMIN_PASSWORD']]] + redisSecret,
+        required: AIRFLOW_REQUIRED + ['WEBSERVER_SECRET_KEY', 'ADMIN_PASSWORD']
+    )
+
+    for (int i = 0; i < AIRFLOW_WORKER_HOSTS.size(); i++) {
+        def wEnv = [:]
+        wEnv.putAll(AIRFLOW)
+        wEnv.putAll([WORKER_QUEUES: 'default', WORKER_CONCURRENCY: '16'])
+        tasks << newTask(
+            id: "airflow-worker-${i + 1}", service: 'airflow-worker', tags: ['airflow', 'airflow-worker'], wave: 4,
+            host: AIRFLOW_WORKER_HOSTS[i], enabled: false,
+            script: 'airflow_cluster_worker.sh', files: airflowSupport, timeoutMin: 90,
+            env: wEnv, creds: AIRFLOW_CREDS, required: AIRFLOW_REQUIRED,
+            secrets: [[group: 'airflow', keys: ['FERNET_KEY', 'WEBSERVER_SECRET_KEY']]] + redisSecret   // same values as control
         )
-    ]) {
+    }
 
-        def sshOpts = '-o StrictHostKeyChecking=no -o ConnectTimeout=15'
+    // =========================================================================
+    //  NEW: APACHE SPARK   -  choose ONE style per project
+    // =========================================================================
 
-        sh """
-            scp -i "\$SSH_KEY" ${sshOpts} \
-            ${env.SCRIPTS_DIR}/${scriptName} \
-            ${params.SSH_USER}@${host}:/tmp/${scriptName}
-        """
-
-        sh """
-            ssh -i "\$SSH_KEY" ${sshOpts} \
-            ${params.SSH_USER}@${host} \
-            'chmod +x /tmp/${scriptName}'
-        """
-
-        writeFile(
-            file: "answers-${scriptName}.txt",
-            text: stdinAnswers
+    // ---- Option A: multi-node standalone cluster (master + N workers) -----------
+    // NOTE: rename spark_install__5_.sh to spark_install.sh in ./scripts/
+    tasks << newTask(
+        id: 'spark-master', service: 'spark-master', tags: ['spark', 'spark-cluster'], wave: 1, host: S.SPARK_MASTER, enabled: false,
+        script: 'spark_install.sh',
+        env: sparkEnv(SPARK, [SPARK_ROLE: 'master', MASTER_IP: S.SPARK_MASTER,
+                              MASTER_UI_PORT: '8080']),
+        required: ['MASTER_IP']
+    )
+    for (int i = 0; i < SPARK_WORKER_HOSTS.size(); i++) {
+        tasks << newTask(
+            id: "spark-worker-${i + 1}", service: 'spark-worker', tags: ['spark', 'spark-cluster'], wave: 2,
+            host: SPARK_WORKER_HOSTS[i], enabled: false,
+            script: 'spark_install.sh',
+            env: sparkEnv(SPARK, [SPARK_ROLE: 'worker', MASTER_IP: S.SPARK_MASTER,
+                                  WORKER_UI_PORT: '8081']),
+            required: ['MASTER_IP']
         )
+    }
 
-        sh """
-            ssh -i "\$SSH_KEY" ${sshOpts} \
-            ${params.SSH_USER}@${host} \
-            'sudo -n ${remoteEnvPrefix}bash /tmp/${scriptName} ${extraFlags}' \
-            < answers-${scriptName}.txt
-        """
+    // ---- Option B: single-node standalone (master + worker on one box) ----------
+    tasks << newTask(
+        id: 'spark-standalone', service: 'spark-standalone', tags: ['spark', 'spark-single'], wave: 1, host: S.SPARK_SINGLE, enabled: false,
+        script: 'spark_standalone_install.sh',
+        env: sparkEnv(SPARK, [MASTER_IP: S.SPARK_SINGLE, MASTER_UI_PORT: '8080',
+                              WORKER_UI_PORT: '8081', WORKER_CORES: '0', WORKER_MEMORY: '0'])
+    )
+
+    // =========================================================================
+    //  NEW: REDIS  -  redis_install.sh  (builds from source, systemd, ACL password)
+    //  Takes the base disk path as its only argument. The path must already exist
+    //  (preDirs creates it). The password is auto-generated and shared with Airflow
+    //  (see REDIS_MANAGED). Wave 1 so it is up before the Airflow nodes (waves 3/4).
+    //  REQUIRES the small patched redis_install.sh (reads REDIS_PASSWORD from the env).
+    // =========================================================================
+    tasks << newTask(
+        id: 'redis', service: 'redis', tags: ['redis'], wave: 1, host: S.REDIS, enabled: false,
+        script: 'redis_install.sh', mode: 'env', timeoutMin: 45,
+        env: [REDIS_BASE_DIR: '/opt/ausiytic'],
+        secrets: [[group: 'redis', keys: ['REDIS_PASSWORD']]],
+        required: ['REDIS_BASE_DIR', 'REDIS_PASSWORD'],
+        flags: '"$REDIS_BASE_DIR"',                      // positional arg <disk-name>
+        preDirs: ['{{REDIS_BASE_DIR}}']
+    )
+
+    // =========================================================================
+    //  NEW: APACHE KAFKA (KRaft, no ZooKeeper)  -  install_kafka_kraft.sh
+    //  The script builds a SINGLE-NODE combined broker+controller. Listing N hosts
+    //  gives you N independent single-node brokers (NOT one N-node cluster).
+    //  stdin order: BASE_DIR, NODE_ID, ADVERTISED_HOST, confirm
+    // =========================================================================
+    for (int i = 0; i < KAFKA_HOSTS.size(); i++) {
+        tasks << newTask(
+            id: "kafka-${i + 1}", service: 'kafka', tags: ['kafka'], wave: 1, host: KAFKA_HOSTS[i], enabled: false,
+            script: 'install_kafka_kraft.sh', mode: 'stdin',
+            env: [KAFKA_BASE_DIR: '/opt/ausiytic', KAFKA_NODE_ID: "${i + 1}",
+                  KAFKA_ADVERTISED_HOST: KAFKA_HOSTS[i]],        // address clients use to reach this broker
+            required: ['KAFKA_BASE_DIR', 'KAFKA_ADVERTISED_HOST'],
+            stdin: ['{{KAFKA_BASE_DIR}}', '{{KAFKA_NODE_ID}}', '{{KAFKA_ADVERTISED_HOST}}', 'y']
+        )
+    }
+
+    // =========================================================================
+    //  NEW: APACHE POLARIS (S3-backed Iceberg REST catalog)  -  polaris_install.sh
+    //  Needs: an existing S3 bucket + an IAM role ARN (EC2 instance role recommended).
+    //  NOTE: the script uses in-memory persistence - a restart of polaris.service wipes
+    //  catalogs and root credentials. Root creds are saved on the server by the script.
+    //  stdin order: BASE_DIR, S3_BUCKET, REGION (blank = auto-detect), ROLE_ARN,
+    //               CATALOG_NAME, confirm
+    // =========================================================================
+    tasks << newTask(
+        id: 'polaris', service: 'polaris', tags: ['polaris', 'iceberg'], wave: 1, host: S.POLARIS, enabled: false,
+        script: 'polaris_install.sh', mode: 'stdin',
+        env: [POLARIS_BASE_DIR: '/opt/ausiytic', S3_BUCKET: 'CHANGE_ME', S3_REGION: '',
+              S3_ROLE_ARN: 'CHANGE_ME', CATALOG_NAME: 'default'],
+        required: ['POLARIS_BASE_DIR', 'S3_BUCKET', 'S3_ROLE_ARN'],
+        // the script re-prompts (and would swallow the next answers) on a malformed ARN - catch it up front
+        patterns: [S3_ROLE_ARN: '^arn:aws:iam::[0-9]{12}:role/.+'],
+        stdin: ['{{POLARIS_BASE_DIR}}', '{{S3_BUCKET}}', '{{S3_REGION}}', '{{S3_ROLE_ARN}}',
+                '{{CATALOG_NAME}}', 'y']
+    )
+
+    // =========================================================================
+    //  NEW: GOOGLE CHROME + CHROMEDRIVER  -  chrome_install.sh
+    //  The Chrome build (CHROME_BUILD="151.0.7922") is hard-coded INSIDE the script, so
+    //  to change the version edit the script in the repo. The script resolves the
+    //  newest published patch of that build and verifies Chrome == ChromeDriver.
+    //  stdin order: scratch/download directory
+    //  NOTE: rename chrome_install (4).sh -> chrome_install.sh in ./scripts/
+    // =========================================================================
+    for (int i = 0; i < CHROME_HOSTS.size(); i++) {
+        tasks << newTask(
+            id: "chrome-${i + 1}", service: 'chrome', tags: ['chrome'], wave: 1, host: CHROME_HOSTS[i], enabled: false,
+            script: 'chrome_install.sh', mode: 'stdin',
+            env: [CHROME_DOWNLOAD_DIR: '/opt/ausiytic/softwares'],
+            required: ['CHROME_DOWNLOAD_DIR'],
+            stdin: ['{{CHROME_DOWNLOAD_DIR}}']
+        )
+    }
+
+    // =========================================================================
+    //  COPY-PASTE TEMPLATE for any new script / server:
+    //
+    //  tasks << newTask(
+    //      id: 'my-task', tags: ['mygroup'], wave: 2, host: S.SOME_SERVER,
+    //      script: 'my_install.sh',                  // file in ./scripts/
+    //      files: ['helper_lib.sh'],                 // optional: sourced/support files
+    //      mode: 'env',                              // or 'stdin' (+ stdin: [...])
+    //      env:   [FOO: 'bar'],
+    //      creds: [DB_PASSWORD: 'jenkins-credential-id'],
+    //      required: ['FOO', 'DB_PASSWORD'],
+    //      flags: '--some-flag value',               // CLI args for the script
+    //      preDirs: ['/data'],                       // mkdir -p before running
+    //      relay: [[fromHost: 'a', fromPath: '/tmp/x', toPath: '/tmp/x']],  // copy a root-only file host a -> here (FATAL if it fails)
+    //      cleanupRemote: [[host: 'a', path: '/tmp/x']],                    // delete it from host a after a successful run
+    //      timeoutMin: 60
+    //  )
+    // =========================================================================
+
+    return [servers: S, tasks: tasks, secretGroups: SECRET_GROUPS]
+}
+
+// Helpers used by the config above --------------------------------------------
+def newTask(Map m) {
+    def d = [service: '', enabled: true, wave: 1, tags: [], files: [], mode: 'env', env: [:], creds: [:],
+             required: [], minLen: [:], patterns: [:], exportEnv: [], secrets: [], flags: '', stdin: [], preDirs: [],
+             fetch: [], relay: [], cleanupRemote: [], timeoutMin: 60]
+    d.putAll(m)
+    // secrets: a single [group:, keys:] map or a list of them -> always a list
+    if (d.secrets instanceof Map) { d.secrets = d.secrets.isEmpty() ? [] : [d.secrets] }
+    d.id = d.id.toString()
+    d.host = d.host.toString()
+    d.wave = d.wave as int
+    return d
+}
+
+def sparkEnv(Map base, Map extra) {
+    def e = [:]
+    e.putAll(base)
+    e.putAll(extra)
+    return e
+}
+
+// Same path resolution as druid_install.sh v6: '/x' absolute, 'name' -> /opt/name, 'root' -> nothing to create
+def druidPreDirs(String raw) {
+    def v = raw.trim().replaceAll('/+$', '')
+    if (v == 'root' || v == '') { return [] }
+    return [v.startsWith('/') ? v : "/opt/${v}"]
+}
+
+// =============================================================================
+//  ENGINE  -  generic, no project-specific content below this line
+// =============================================================================
+
+// Every service name the SERVERS parameter accepts.
+def knownServices() {
+    return ['pg', 'opensearch', 'dashboards', 'druid', 'nifi', 'httpd', 'redis',
+            'airflow-control', 'airflow-worker', 'spark-master', 'spark-worker', 'spark-standalone',
+            'kafka', 'chrome', 'polaris', 'hive', 'presto']
+}
+
+// Services that may be placed on MANY servers; everything else is one-per-project.
+// (nifi: 1 host = standalone, 2 hosts = cluster; projectConfig() rejects more than 2.)
+def multiServices() {
+    return ['airflow-worker', 'spark-worker', 'kafka', 'chrome', 'nifi']
+}
+
+// "host = svc, svc" lines  ->  [service: [hosts]]
+def parsePlacement(String raw) {
+    def res = [:]
+    def known = knownServices()
+    for (rawLine in (raw ?: '').split('\n')) {
+        def line = rawLine.replaceAll('#.*$', '').trim()
+        if (!line) { continue }
+        int sep = line.indexOf('=')
+        if (sep < 0) { sep = line.indexOf(':') }
+        if (sep < 1) { error "Bad SERVERS line (expected 'host = service, service'): ${line}" }
+        def host = line.substring(0, sep).trim()
+        for (svc in csv(line.substring(sep + 1))) {
+            if (!known.contains(svc)) { error "Unknown service '${svc}' in SERVERS. Valid: ${known.join(', ')}" }
+            if (!res.containsKey(svc)) { res[svc] = [] }
+            if (!res[svc].contains(host)) { res[svc] << host }
+        }
+    }
+    def multi = multiServices()
+    for (svc in res.keySet()) {
+        if (!multi.contains(svc) && res[svc].size() > 1) {
+            error "Service '${svc}' can only be placed on ONE server, but SERVERS lists: ${res[svc].join(', ')}"
+        }
+    }
+    return res
+}
+
+// Host for a single-instance service: from SERVERS if placed, else the default.
+def hostOf(Map placement, String service, String dflt) {
+    def hosts = placement[service]
+    return (hosts && !hosts.isEmpty()) ? hosts[0] : dflt
+}
+
+// Hosts from a comma-separated build parameter (de-duplicated, order kept), else the config default.
+def pickHosts(String paramValue, List defaults) {
+    def fromParam = []
+    for (h in csv(paramValue)) {
+        if (!fromParam.contains(h)) { fromParam << h }
+    }
+    return fromParam.isEmpty() ? defaults : fromParam
+}
+
+def csv(String s) {
+    def out = []
+    for (p in (s ?: '').split(',')) {
+        if (p.trim()) { out << p.trim() }
+    }
+    return out
+}
+
+def matchesAny(Map t, List keys) {
+    if (keys.contains(t.id)) { return true }
+    for (tag in t.tags) {
+        if (keys.contains(tag)) { return true }
+    }
+    return false
+}
+
+def parseOverrides(String raw) {
+    def res = [global: [:], perTask: [:]]
+    for (rawLine in (raw ?: '').split('\n')) {
+        def line = rawLine.trim()
+        if (!line || line.startsWith('#')) { continue }
+        int eq = line.indexOf('=')
+        if (eq < 1) { error "Bad OVERRIDES line (need KEY=VALUE): ${line}" }
+        def k = line.substring(0, eq).trim()
+        def v = line.substring(eq + 1)
+        int dot = k.indexOf('.')
+        if (dot > 0) {
+            def tid = k.substring(0, dot)
+            if (!res.perTask.containsKey(tid)) { res.perTask[tid] = [:] }
+            res.perTask[tid][k.substring(dot + 1)] = v
+        } else {
+            res.global[k] = v
+        }
+    }
+    return res
+}
+
+// Selected tasks, with OVERRIDES applied.
+def buildPlan() {
+    def cfg = projectConfig()
+    def only = csv(params.ONLY)
+    def skip = csv(params.SKIP)
+    def ov = parseOverrides(params.OVERRIDES)
+    def placement = parsePlacement(params.SERVERS)
+    def plan = []
+
+    for (t in cfg.tasks) {
+        if (!placement.isEmpty()) {
+            // SERVERS given: run exactly the placed services (enabled flags ignored);
+            // ONLY/SKIP can still narrow it further.
+            if (!t.service || !placement.containsKey(t.service)) { continue }
+            if (!only.isEmpty() && !matchesAny(t, only)) { continue }
+        } else if (!only.isEmpty()) {
+            if (!matchesAny(t, only)) { continue }
+        } else if (!t.enabled) {
+            continue
+        }
+        if (!skip.isEmpty() && matchesAny(t, skip)) { continue }
+
+        for (k in ov.global.keySet()) {
+            if (t.env.containsKey(k)) { t.env[k] = ov.global[k] }
+        }
+        if (ov.perTask.containsKey(t.id)) {
+            for (k in ov.perTask[t.id].keySet()) { t.env[k] = ov.perTask[t.id][k] }
+        }
+        plan << t
+    }
+    return plan
+}
+
+def validatePlan(List plan) {
+    def errors = []
+    def seen = [:]
+    def hostRe = /^[A-Za-z0-9.\-]+$/
+    def pathRe = /^\/[A-Za-z0-9_.\/\-]+$/
+    for (t in plan) {
+        def p = "[${t.id}]"
+        if (seen.containsKey(t.id)) { errors << "${p} duplicate task id" }
+        seen[t.id] = true
+
+        if (!(t.host ==~ hostRe) || t.host.contains('CHANGE_ME')) {
+            errors << "${p} host '${t.host}' is not set - fix the servers / worker host list in projectConfig()"
+        }
+        if (!(t.mode in ['env', 'stdin'])) { errors << "${p} mode must be 'env' or 'stdin'" }
+        if (!fileExists("${env.SCRIPTS_DIR}/${t.script}")) { errors << "${p} missing ${env.SCRIPTS_DIR}/${t.script}" }
+        for (f in t.files) {
+            if (!fileExists("${env.SCRIPTS_DIR}/${f}")) { errors << "${p} missing support file ${env.SCRIPTS_DIR}/${f}" }
+        }
+        for (k in t.required) {
+            def v = t.env[k]?.toString()?.trim()
+            def fromSecrets = false
+            for (sc in t.secrets) { if (sc.keys.contains(k)) { fromSecrets = true } }
+            if (!v && !t.creds.containsKey(k) && !fromSecrets) { errors << "${p} required value ${k} is empty (set it in env or creds)" }
+            if (v && v.contains('CHANGE_ME')) { errors << "${p} ${k} is still CHANGE_ME" }
+        }
+        for (sc in t.secrets) {
+            def grp = projectConfig().secretGroups[sc.group]
+            if (!grp) {
+                errors << "${p} unknown secret group '${sc.group}'"
+            } else {
+                for (k in sc.keys) {
+                    if (!grp.keys.containsKey(k)) { errors << "${p} secret ${k} is not defined in group '${sc.group}'" }
+                }
+            }
+        }
+        for (k in t.patterns.keySet()) {
+            def pv = t.env[k]?.toString()?.trim()
+            if (pv && !pv.contains('CHANGE_ME') && !(pv ==~ t.patterns[k])) {
+                errors << "${p} ${k}='${pv}' does not match the expected format ${t.patterns[k]}"
+            }
+        }
+        for (d in t.preDirs) {
+            if (!d.contains('{{') && !(d ==~ pathRe)) { errors << "${p} unsafe preDir '${d}'" }
+        }
+        for (k in t.creds.keySet()) {
+            if (!t.creds[k]?.toString()?.trim()) { errors << "${p} credential id for ${k} is blank" }
+        }
+        for (r in t.relay) {
+            if (!(r.fromHost.toString() ==~ hostRe) || r.fromHost.toString().contains('CHANGE_ME')) { errors << "${p} relay source host '${r.fromHost}' is not set" }
+            if (!(r.fromPath.toString() ==~ pathRe)) { errors << "${p} unsafe relay source path '${r.fromPath}'" }
+            if (!(r.toPath.toString() ==~ pathRe)) { errors << "${p} unsafe relay target path '${r.toPath}'" }
+        }
+        for (c in t.cleanupRemote) {
+            if (!(c.host.toString() ==~ hostRe) || c.host.toString().contains('CHANGE_ME')) { errors << "${p} cleanup host '${c.host}' is not set" }
+            if (!(c.path.toString() ==~ pathRe)) { errors << "${p} unsafe cleanup path '${c.path}'" }
+        }
+    }
+    return errors
+}
+
+def printPlan(List plan) {
+    def lines = ['', "Deployment plan (${plan.size()} task(s)):"]
+    def waves = []
+    for (t in plan) { if (!waves.contains(t.wave)) { waves << t.wave } }
+    waves.sort()
+    for (w in waves) {
+        lines << "  Wave ${w}:"
+        for (t in plan) {
+            if (t.wave == w) {
+                def relayFrom = []
+                for (r in t.relay) { relayFrom << r.fromHost.toString() }
+                lines << "    - ${t.id.padRight(20)} ${t.host.padRight(16)} ${t.script}  [${t.mode}]" +
+                         (t.creds.isEmpty() ? '' : "  creds: ${t.creds.keySet().join(',')}") +
+                         (relayFrom.isEmpty() ? '' : "  relay-from: ${relayFrom.join(',')}")
+            }
+        }
+    }
+    echo lines.join('\n')
+}
+
+def executePlan(List plan, boolean dryRun, boolean parallelHosts) {
+    if (dryRun) {
+        echo 'DRY_RUN=true - nothing executed.'
+        return
+    }
+    def waves = []
+    for (t in plan) { if (!waves.contains(t.wave)) { waves << t.wave } }
+    waves.sort()
+
+    // Generate-once / read-back of shared secrets, BEFORE any install starts.
+    def sharedSecrets = resolveSharedSecrets(plan)
+
+    for (w in waves) {
+        def wave = w
+        stage("Wave ${wave}") {
+            // group this wave's tasks by host (same host => sequential)
+            def byHost = [:]
+            for (t in plan) {
+                if (t.wave == wave) {
+                    if (!byHost.containsKey(t.host)) { byHost[t.host] = [] }
+                    byHost[t.host] << t
+                }
+            }
+            def branches = [:]
+            for (h in byHost.keySet()) {
+                def hostTasks = byHost[h]
+                branches["${h}"] = {
+                    for (ht in hostTasks) {
+                        def task = ht
+                        stage("${task.id} @ ${task.host}") {
+                            timeout(time: task.timeoutMin as int, unit: 'MINUTES') {
+                                runTask(task, sharedSecrets)
+                            }
+                        }
+                    }
+                }
+            }
+            if (parallelHosts && branches.size() > 1) {
+                branches.failFast = false      // let running installs finish instead of killing them mid-apt
+                parallel branches
+            } else {
+                branches.remove('failFast')
+                for (k in branches.keySet()) { branches[k]() }
+            }
+        }
     }
 }
 
-// -----------------------------------------------------------------------
-// Runs a single one-off command on a target host over SSH (used for the
-// pre-flight mkdir checks). Not for interactive scripts - no stdin piping.
-// -----------------------------------------------------------------------
-def sshRunCommand(String host, String remoteCommand) {
-    withCredentials([
-        sshUserPrivateKey(
-            credentialsId: params.SSH_CREDENTIALS_ID,
-            keyFileVariable: 'SSH_KEY',
-            usernameVariable: 'SSH_USER_CRED'
-        )
-    ]) {
-        def sshOpts = '-o StrictHostKeyChecking=no -o ConnectTimeout=15'
-        sh """
-            ssh -i "\$SSH_KEY" ${sshOpts} \
-            ${params.SSH_USER}@${host} \
-            '${remoteCommand}'
-        """
+// For every secret group used by the plan: make sure each key exists on the store host
+// (generate if missing, never overwrite), then read them all back. Returns [group: [KEY: value]].
+def resolveSharedSecrets(List plan) {
+    def cfg = projectConfig()
+    def groups = []
+    for (t in plan) {
+        for (sc in t.secrets) {
+            if (!groups.contains(sc.group)) { groups << sc.group }
+        }
     }
+    def out = [:]
+    for (g in groups) {
+        out[g] = ensureSharedSecrets(g, cfg.secretGroups[g])
+    }
+    return out
 }
 
-// -----------------------------------------------------------------------
-// Copies a file from srcHost down to the Jenkins agent workspace, then
-// pushes it up to dstHost. Used to move OpenSearch's root-ca.pem from
-// DB1_SERVER to APP_SERVER since the two servers can't scp to each other
-// directly (no SSH trust between target hosts, only between the agent and
-// each host). Returns true on success, false (non-fatal) if the source
-// file doesn't exist or the copy fails for any reason.
-// -----------------------------------------------------------------------
-def fetchRemoteFileThenPush(String srcHost, String srcPath, String dstHost, String dstPath) {
-    def localTmp = "fetched-${System.currentTimeMillis()}.tmp"
-    try {
-        withCredentials([
-            sshUserPrivateKey(
-                credentialsId: params.SSH_CREDENTIALS_ID,
-                keyFileVariable: 'SSH_KEY',
-                usernameVariable: 'SSH_USER_CRED'
-            )
-        ]) {
-            def sshOpts = '-o StrictHostKeyChecking=no -o ConnectTimeout=15'
+def ensureSharedSecrets(String name, Map grp) {
+    def gens = [
+        fernet  : 'head -c32 /dev/urandom | base64 | tr "+/" "-_" | tr -d "\\n"',   // valid Fernet key (urlsafe b64 of 32 bytes)
+        hex32   : 'od -An -tx1 -N16 /dev/urandom | tr -d " \\n"',                   // 32 hex chars
+        password: 'head -c48 /dev/urandom | base64 | tr -dc "A-Za-z0-9" | head -c24'
+    ]
+    if (!(grp.host ==~ /^[A-Za-z0-9.\-]+$/) || grp.host.contains('CHANGE_ME')) {
+        error "Secret group '${name}': store host '${grp.host}' is not set."
+    }
+    if (!(grp.path ==~ /^\/[A-Za-z0-9_.\/\-]+$/)) { error "Secret group '${name}': unsafe path '${grp.path}'" }
 
-            def rc = sh(
-                script: """
-                    scp -i "\$SSH_KEY" ${sshOpts} \
-                    ${params.SSH_USER}@${srcHost}:${srcPath} \
-                    ${localTmp}
-                """,
-                returnStatus: true
-            )
-            if (rc != 0) {
-                echo "Could not fetch ${srcPath} from ${srcHost} (exit ${rc}) - continuing without it."
-                return false
+    def sb = new StringBuilder()
+    sb << '#!/bin/bash\nset -e\numask 077\n'
+    sb << 'F=' + shq(grp.path) + '\n'
+    sb << 'mkdir -p "$(dirname "$F")"\ntouch "$F"\nchmod 600 "$F"\n'
+    for (k in grp.keys.keySet()) {
+        if (!(k ==~ /^[A-Z_][A-Z0-9_]*$/)) { error "Secret group '${name}': bad key name '${k}'" }
+        def gen = gens[grp.keys[k]]
+        if (!gen) { error "Secret group '${name}': unknown generator '${grp.keys[k]}' for ${k}" }
+        sb << 'grep -q "^' + k + '=" "$F" || echo "' + k + '=$(' + gen + ')" >> "$F"\n'
+    }
+    sb << 'cat "$F"\n'
+
+    def sshOpts = '-o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=15'
+    def SSH = 'ssh -i "$SSH_KEY" ' + sshOpts
+    def SCP = 'scp -i "$SSH_KEY" ' + sshOpts
+    def target = "${params.SSH_USER}@${grp.host}"
+    def jobSafe = env.JOB_BASE_NAME.replaceAll('[^A-Za-z0-9_.-]', '_')
+    def rdir = "/tmp/jenkins-deploy-${jobSafe}/secrets-${name}"
+    def ldir = ".deploy/secrets-${name}"
+    def result = [:]
+
+    withCredentials([sshUserPrivateKey(credentialsId: params.SSH_CREDENTIALS_ID,
+                                       keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER_CRED')]) {
+        try {
+            sh "mkdir -p ${ldir}"
+            writeFile(file: "${ldir}/gen.sh", text: sb.toString())
+            sh "${SSH} ${target} 'mkdir -p ${rdir} && chmod 700 ${rdir}'"
+            sh "${SCP} ${ldir}/gen.sh ${target}:${rdir}/gen.sh"
+            // returnStdout: values are never echoed to the build log
+            def raw = sh(script: "${SSH} ${target} 'sudo -n bash ${rdir}/gen.sh'", returnStdout: true)
+            for (line in raw.split('\n')) {
+                if (line ==~ /^[A-Z_][A-Z0-9_]*=.+$/) {
+                    int eq = line.indexOf('=')
+                    result[line.substring(0, eq)] = line.substring(eq + 1).trim()
+                }
+            }
+            for (k in grp.keys.keySet()) {
+                if (!result.containsKey(k)) { error "Secret group '${name}': ${k} missing on ${grp.host}:${grp.path} after generation." }
+            }
+            echo "Shared secret group '${name}' ready (${grp.keys.keySet().join(', ')}) - stored at ${grp.host}:${grp.path}, values not logged."
+        } finally {
+            sh(script: "${SSH} ${target} 'rm -f ${rdir}/gen.sh'", returnStatus: true)
+            sh "rm -rf ${ldir} || true"
+        }
+    }
+    return result
+}
+
+@NonCPS
+def shq(String v) {
+    return "'" + v.replace("'", "'\\''") + "'"
+}
+
+def renderTokens(String s, Map vals) {
+    def out = s
+    for (k in vals.keySet()) {
+        out = out.replace('{{' + k + '}}', vals[k])
+    }
+    if (out.contains('{{')) { error "Unresolved {{token}} in: ${s}" }
+    return out
+}
+
+// Upload script(+support files) and a generated run.sh, execute as root, clean up.
+def runTask(Map t, Map sharedSecrets) {
+    def sshOpts = '-o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=15 ' +
+                  '-o ServerAliveInterval=30 -o ServerAliveCountMax=40'
+    def SSH = 'ssh -i "$SSH_KEY" ' + sshOpts      // single quotes: $SSH_KEY is expanded by the shell, not Groovy
+    def SCP = 'scp -i "$SSH_KEY" ' + sshOpts
+    def target = "${params.SSH_USER}@${t.host}"
+    def jobSafe = env.JOB_BASE_NAME.replaceAll('[^A-Za-z0-9_.-]', '_')
+    def rdir = "/tmp/jenkins-deploy-${jobSafe}/${t.id}"
+    def ldir = ".deploy/${t.id}"
+
+    def bindings = [sshUserPrivateKey(credentialsId: params.SSH_CREDENTIALS_ID,
+                                      keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER_CRED')]
+    def credKeys = t.creds.keySet() as List
+    for (k in credKeys) {
+        bindings << string(credentialsId: t.creds[k].toString(), variable: "CRED_${k}")
+    }
+
+    withCredentials(bindings) {
+        try {
+            // ---- resolve every value (plain env + credentials) ----
+            def vals = [:]
+            for (k in t.env.keySet()) { vals[k] = (t.env[k] == null ? '' : t.env[k].toString()) }
+            for (k in credKeys) { vals[k] = env."CRED_${k}" ?: '' }
+            // auto-generated shared secrets (explicit env/creds of the same name win)
+            for (sc in t.secrets) {
+                def grpVals = sharedSecrets[sc.group] ?: [:]
+                for (k in sc.keys) {
+                    if (!(vals[k] ?: '').trim()) {
+                        if (!grpVals.containsKey(k)) { error "[${t.id}] shared secret ${k} was not resolved." }
+                        vals[k] = grpVals[k]
+                    }
+                }
             }
 
-            sh """
-                scp -i "\$SSH_KEY" ${sshOpts} \
-                ${localTmp} \
-                ${params.SSH_USER}@${dstHost}:${dstPath}
-            """
+            for (k in t.minLen.keySet()) {
+                if ((vals[k] ?: '').length() < (t.minLen[k] as int)) {
+                    error "[${t.id}] ${k} must be at least ${t.minLen[k]} characters."
+                }
+            }
+            for (k in t.required) {
+                if (!(vals[k] ?: '').trim()) { error "[${t.id}] required value ${k} is empty." }
+            }
+
+            // ---- pre-flight dirs ----
+            for (rawDir in t.preDirs) {
+                def d = renderTokens(rawDir, vals)
+                if (!(d ==~ /^\/[A-Za-z0-9_.\/\-]+$/)) { error "[${t.id}] unsafe preDir '${d}'" }
+                sh "${SSH} ${target} 'sudo -n mkdir -p ${d}'"
+            }
+
+            // ---- remote working dir + uploads ----
+            sh "${SSH} ${target} 'mkdir -p ${rdir} && chmod 700 ${rdir}'"
+            def uploads = [t.script] + t.files
+            for (f in uploads) {
+                sh "${SCP} ${env.SCRIPTS_DIR}/${f} ${target}:${rdir}/${f}"
+            }
+
+            // ---- relay root-only files from another host (e.g. the NiFi cluster bundle: Node 1 -> Jenkins -> Node 2) ----
+            for (r in t.relay) {
+                relayFile(SSH, SCP, r.fromHost.toString(), r.fromPath.toString(), t.host, r.toPath.toString(), t.id, rdir)
+            }
+
+            // ---- optional cross-host file copies (host A -> Jenkins -> this host) ----
+            def flags = t.flags ?: ''
+            for (f in t.fetch) {
+                if (fetchThenPush(SSH, SCP, f.fromHost, f.fromPath, t.host, f.toPath, t.id)) {
+                    if (f.flag) { flags += ' ' + f.flag }
+                } else {
+                    echo "WARNING [${t.id}]: could not fetch ${f.fromPath} from ${f.fromHost}; continuing without it."
+                }
+            }
+
+            // ---- generated run.sh (holds secrets; chmod 600; deleted after run) ----
+            def exports = (t.mode == 'env') ? (vals.keySet() as List) : t.exportEnv
+            def sb = new StringBuilder()
+            sb << "#!/bin/bash\n"
+            for (k in exports) {
+                if (!(k ==~ /^[A-Za-z_][A-Za-z0-9_]*$/)) { error "[${t.id}] invalid env var name '${k}'" }
+                sb << "export ${k}=${shq(vals[k] ?: '')}\n"
+            }
+            if (t.mode == 'env') { sb << "export AUTOMATED=1\n" }
+            sb << "cd \"\$(dirname \"\$0\")\"\n"
+            sb << "exec bash ./${t.script} ${flags}\n"
+            sh "mkdir -p ${ldir}"
+            writeFile(file: "${ldir}/run.sh", text: sb.toString())
+            sh "chmod 600 ${ldir}/run.sh"
+            sh "${SCP} ${ldir}/run.sh ${target}:${rdir}/run.sh"
+
+            // ---- stdin answers (legacy mode) ----
+            def stdinFile = '/dev/null'
+            if (t.mode == 'stdin') {
+                def lines = []
+                for (l in t.stdin) { lines << renderTokens(l.toString(), vals) }
+                stdinFile = "${ldir}/answers.txt"
+                writeFile(file: stdinFile, text: lines.join('\n') + '\n')
+                sh "chmod 600 ${stdinFile}"
+            }
+
+            // ---- run ----
+            echo "[${t.id}] running ${t.script} on ${t.host} ..."
+            sh "${SSH} ${target} 'sudo -n bash ${rdir}/run.sh' < ${stdinFile}"
+            echo "[${t.id}] finished OK."
+
+            // ---- after a SUCCESSFUL run: remove relayed secret files from their source host ----
+            for (c in t.cleanupRemote) {
+                sh(script: "${SSH} ${params.SSH_USER}@${c.host} 'sudo -n rm -f ${c.path}'", returnStatus: true)
+                echo "[${t.id}] removed ${c.path} from ${c.host}."
+            }
+        } finally {
+            // secrets must never be left behind, success or failure
+            sh(script: "${SSH} ${target} 'rm -f ${rdir}/run.sh ${rdir}/relay.bin'", returnStatus: true)
+            sh "rm -rf ${ldir} || true"
         }
-        return true
-    } catch (Exception e) {
-        echo "Error copying ${srcPath} from ${srcHost} to ${dstHost}:${dstPath} - continuing without it. (${e.message})"
-        return false
-    } finally {
-        sh "rm -f ${localTmp}"
     }
 }
 
+// Copies a ROOT-ONLY file srcHost:srcPath -> Jenkins workspace -> dstHost:dstPath (root, mode 600).
+// Unlike fetchThenPush this is FATAL on failure: the task cannot work without the file.
+// Must be called inside withCredentials (needs $SSH_KEY).
+def relayFile(String SSH, String SCP, String srcHost, String srcPath, String dstHost, String dstPath, String taskId, String rdir) {
+    def tmp = ".deploy/${taskId}/relay.tmp"
+    try {
+        sh "mkdir -p .deploy/${taskId}"
+        def rc = sh(script: "umask 077; ${SSH} ${params.SSH_USER}@${srcHost} 'sudo -n cat ${srcPath}' > ${tmp}", returnStatus: true)
+        def nonEmpty = sh(script: "test -s ${tmp}", returnStatus: true)
+        if (rc != 0 || nonEmpty != 0) {
+            error "[${taskId}] could not read ${srcPath} from ${srcHost}. Has the task that creates it (e.g. nifi-1) run successfully?"
+        }
+        sh "${SCP} ${tmp} ${params.SSH_USER}@${dstHost}:${rdir}/relay.bin"
+        sh "${SSH} ${params.SSH_USER}@${dstHost} 'sudo -n install -m 600 -o root -g root ${rdir}/relay.bin ${dstPath} && rm -f ${rdir}/relay.bin'"
+        echo "[${taskId}] relayed ${srcPath} from ${srcHost} to ${dstHost}:${dstPath} (contents not logged)."
+    } finally {
+        sh "rm -f ${tmp} || true"
+    }
+}
+
+// Copies srcHost:srcPath -> Jenkins workspace -> dstHost:dstPath. Must be called inside
+// withCredentials (needs $SSH_KEY). Returns false (never throws) if anything fails.
+def fetchThenPush(String SSH, String SCP, String srcHost, String srcPath, String dstHost, String dstPath, String taskId) {
+    def tmp = ".deploy/${taskId}/fetched.tmp"
+    try {
+        sh "mkdir -p .deploy/${taskId}"
+        def rc = sh(script: "${SCP} ${params.SSH_USER}@${srcHost}:${srcPath} ${tmp}", returnStatus: true)
+        if (rc != 0) { return false }
+        sh "${SCP} ${tmp} ${params.SSH_USER}@${dstHost}:${dstPath}"
+        return true
+    } catch (Exception e) {
+        echo "fetchThenPush error: ${e.message}"
+        return false
+    } finally {
+        sh "rm -f ${tmp} || true"
+    }
+}
