@@ -421,6 +421,10 @@ step_configure_yml() {
     set_yaml_kv_force "opensearch.username" "$(yaml_dq "${OS_USERNAME}")"
     set_yaml_kv_force "opensearch.password" "$(yaml_dq "${OS_PASSWORD}")"
     set_yaml_kv_force "opensearch.ssl.verificationMode" "${SSL_VERIFICATION_MODE}"
+    # 3.x only accepts ONE of the two spellings. If a stale 'requestHeadersWhitelist' line is left in the
+    # file (e.g. from an older install script that was saved into .orig), Dashboards crashes with
+    # "[opensearch].requestHeadersAllowlist: definition for this key is missing". Remove the old names first.
+    sed -i -E '/^[[:space:]]*#?[[:space:]]*opensearch\.requestHeadersWhitelist(Configured)?:/d' "${yml}"
     set_yaml_kv_force "opensearch.requestHeadersAllowlist" "[authorization, securitytenant]"
     if [[ -n "${SSL_CA_PATH}" ]]; then
         set_yaml_kv_force "opensearch.ssl.certificateAuthorities" "[$(yaml_dq "${SSL_CA_PATH}")]"
