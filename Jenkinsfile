@@ -81,6 +81,14 @@
    BACK UP that file: losing it means losing the FERNET_KEY that encrypts the
    connections/variables in the Airflow DB.
 
+ SSH KEYS PER SERVER  (HOST_KEYS, optional)
+   By default every server is reached with the credential SSH_CREDENTIALS_ID. If some servers
+   use a different key, add one Jenkins "SSH Username with private key" credential per key and
+   list the servers of each key on one line (many servers can share a key):
+       key-db  = 10.0.1.21, 10.0.1.22, 10.0.1.23
+       key-app = 10.0.1.31, 10.0.1.32
+   Unlisted servers use SSH_CREDENTIALS_ID. The login user is still SSH_USER for all servers.
+
  SECRETS
    Never put passwords in this file. Map ENV_NAME -> Jenkins "Secret text"
    credential ID under `creds:`. They are masked in the log, written to a
@@ -115,7 +123,8 @@ pipeline {
     parameters {
         // ---------------- General ----------------
         string(name: 'SSH_USER', defaultValue: 'ubuntu', description: 'OS login user on all target servers')
-        string(name: 'SSH_CREDENTIALS_ID', defaultValue: 'aws-ubuntu-ssh', description: 'Jenkins credential ID (SSH Username with private key)')
+        string(name: 'SSH_CREDENTIALS_ID', defaultValue: 'aws-ubuntu-ssh', description: 'Default Jenkins credential ID (SSH Username with private key), used for every server not listed in HOST_KEYS')
+        text(name: 'HOST_KEYS', defaultValue: '', description: 'Optional, one key per line:  credentialId = host, host, host ...   Servers sharing a key go on the same line. Servers not listed use SSH_CREDENTIALS_ID. e.g.  key-db = 10.0.1.21, 10.0.1.22')
         text(name: 'SERVERS', defaultValue: '', description: 'Placement, one server per line:  host = service, service, ...   e.g.  10.0.1.23 = airflow-worker, spark-worker, chrome  (blank = use defaults / per-role params)')
         string(name: 'ONLY', defaultValue: '', description: 'Task ids / tags to run (blank = every enabled task)')
         string(name: 'SKIP', defaultValue: '', description: 'Task ids / tags to skip')
@@ -664,6 +673,32 @@ def pv(String name, String dflt) {
     return s ? s : dflt
 }
 
+// HOST_KEYS: "credentialId = host, host, ..." lines  ->  [host: credentialId]
+// Many servers can share one key (put them on the same line). A host may appear under only one key.
+def parseHostKeys(String raw) {
+    def res = [:]
+    for (rawLine in (raw ?: '').split('\n')) {
+        def line = rawLine.replaceAll('#.*$', '').trim()
+        if (!line) { continue }
+        int sep = line.indexOf('=')
+        if (sep < 1) { error "Bad HOST_KEYS line (expected 'credentialId = host, host'): ${line}" }
+        def credId = line.substring(0, sep).trim()
+        for (h in csv(line.substring(sep + 1))) {
+            if (res.containsKey(h) && res[h] != credId) {
+                error "HOST_KEYS: host ${h} is listed under two different keys (${res[h]} and ${credId})"
+            }
+            res[h] = credId
+        }
+    }
+    return res
+}
+
+// SSH credential ID for a host: its HOST_KEYS entry, else the default SSH_CREDENTIALS_ID.
+def keyIdFor(String host) {
+    def m = parseHostKeys(params.HOST_KEYS)
+    return m.containsKey(host) ? m[host] : params.SSH_CREDENTIALS_ID
+}
+
 def sparkEnv(Map base, Map extra) {
     def e = [:]
     e.putAll(base)
@@ -807,6 +842,7 @@ def buildPlan() {
 
 def validatePlan(List plan) {
     def errors = []
+    parseHostKeys(params.HOST_KEYS)      // fails early on a malformed HOST_KEYS
     def seen = [:]
     for (t in plan) {
         def p = "[${t.id}]"
@@ -864,7 +900,8 @@ def printPlan(List plan) {
         for (t in plan) {
             if (t.wave == w) {
                 lines << "    - ${t.id.padRight(20)} ${t.host.padRight(16)} ${t.script}  [${t.mode}]" +
-                         (t.creds.isEmpty() ? '' : "  creds: ${t.creds.keySet().join(',')}")
+                         (t.creds.isEmpty() ? '' : "  creds: ${t.creds.keySet().join(',')}") +
+                         "  ssh-key: ${keyIdFor(t.host)}"
                 // show the non-secret inputs that came from the build parameters
                 if (t.mode == 'stdin') {
                     def shown = []
@@ -974,7 +1011,7 @@ def ensureSharedSecrets(String name, Map grp) {
     def ldir = ".deploy/secrets-${name}"
     def result = [:]
 
-    withCredentials([sshUserPrivateKey(credentialsId: params.SSH_CREDENTIALS_ID,
+    withCredentials([sshUserPrivateKey(credentialsId: keyIdFor(grp.host),
                                        keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER_CRED')]) {
         try {
             sh "mkdir -p ${ldir}"
@@ -1026,8 +1063,15 @@ def runTask(Map t, Map sharedSecrets) {
     def rdir = "/tmp/jenkins-deploy-${jobSafe}/${t.id}"
     def ldir = ".deploy/${t.id}"
 
-    def bindings = [sshUserPrivateKey(credentialsId: params.SSH_CREDENTIALS_ID,
+    def bindings = [sshUserPrivateKey(credentialsId: keyIdFor(t.host),
                                       keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER_CRED')]
+    // one extra key binding per cross-host copy: the source host may use a different key
+    int bi = 0
+    for (f in t.fetch) {
+        bindings << sshUserPrivateKey(credentialsId: keyIdFor(f.fromHost),
+                                      keyFileVariable: "SRC_KEY_${bi}", usernameVariable: "SRC_USER_${bi}")
+        bi++
+    }
     def credKeys = t.creds.keySet() as List
     for (k in credKeys) {
         bindings << string(credentialsId: t.creds[k].toString(), variable: "CRED_${k}")
@@ -1075,8 +1119,12 @@ def runTask(Map t, Map sharedSecrets) {
 
             // ---- optional cross-host file copies (host A -> Jenkins -> this host) ----
             def flags = t.flags ?: ''
+            int fi = 0
             for (f in t.fetch) {
-                if (fetchThenPush(SSH, SCP, f.fromHost, f.fromPath, t.host, f.toPath, t.id, f.sudo ? true : false)) {
+                def SSH_SRC = 'ssh -i "$SRC_KEY_' + fi + '" ' + sshOpts
+                def SCP_SRC = 'scp -i "$SRC_KEY_' + fi + '" ' + sshOpts
+                fi++
+                if (fetchThenPush(SSH_SRC, SCP_SRC, SCP, f.fromHost, f.fromPath, t.host, f.toPath, t.id, f.sudo ? true : false)) {
                     if (f.flag) { flags += ' ' + f.flag }
                 } else if (f.required) {
                     error "[${t.id}] could not copy ${f.fromPath} from ${f.fromHost} (is the first node installed and does SSH_USER have sudo there?)"
@@ -1136,7 +1184,7 @@ def runTask(Map t, Map sharedSecrets) {
 // Copies srcHost:srcPath -> Jenkins workspace -> dstHost:dstPath. Must be called inside
 // withCredentials (needs $SSH_KEY). useSudo reads the source with 'sudo cat' (root-only files).
 // Returns false (never throws) if anything fails.
-def fetchThenPush(String SSH, String SCP, String srcHost, String srcPath, String dstHost, String dstPath, String taskId, boolean useSudo) {
+def fetchThenPush(String SSH_SRC, String SCP_SRC, String SCP_DST, String srcHost, String srcPath, String dstHost, String dstPath, String taskId, boolean useSudo) {
     def tmp = ".deploy/${taskId}/fetched.tmp"
     try {
         if (!(srcPath ==~ /^\/[A-Za-z0-9_.\/\-]+$/)) {
@@ -1146,13 +1194,13 @@ def fetchThenPush(String SSH, String SCP, String srcHost, String srcPath, String
         sh "mkdir -p .deploy/${taskId}"
         def rc
         if (useSudo) {
-            rc = sh(script: "umask 077; ${SSH} ${params.SSH_USER}@${srcHost} 'sudo -n cat ${srcPath}' > ${tmp}", returnStatus: true)
+            rc = sh(script: "umask 077; ${SSH_SRC} ${params.SSH_USER}@${srcHost} 'sudo -n cat ${srcPath}' > ${tmp}", returnStatus: true)
         } else {
-            rc = sh(script: "${SCP} ${params.SSH_USER}@${srcHost}:${srcPath} ${tmp}", returnStatus: true)
+            rc = sh(script: "${SCP_SRC} ${params.SSH_USER}@${srcHost}:${srcPath} ${tmp}", returnStatus: true)
         }
         if (rc != 0) { return false }
         sh "chmod 600 ${tmp}"
-        sh "${SCP} ${tmp} ${params.SSH_USER}@${dstHost}:${dstPath}"
+        sh "${SCP_DST} ${tmp} ${params.SSH_USER}@${dstHost}:${dstPath}"
         return true
     } catch (Exception e) {
         echo "fetchThenPush error: ${e.message}"
@@ -1161,3 +1209,4 @@ def fetchThenPush(String SSH, String SCP, String srcHost, String srcPath, String
         sh "rm -f ${tmp} || true"
     }
 }
+
