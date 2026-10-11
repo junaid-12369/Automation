@@ -51,7 +51,9 @@
 # Optional variables (all have defaults):
 #   OS_VERSION (3.3.2)      BASE_DIR (/opt/ausiytic)     SERVICE_USER (opensearch)
 #   HTTP_PORT (9200)        TRANSPORT_PORT (9300)        CLUSTER_NAME (ausiytic-opensearch)
-#   OS_ROOT      install root            (default $BASE_DIR/search/opensearch)
+#   BASE_DIR     base path. The script checks that $BASE_DIR/softwares and $BASE_DIR/apps
+#                exist and CREATES them if missing (no searching for existing installs).
+#   OS_ROOT      install root            (default $BASE_DIR/apps/opensearch)
 #   OS_HOME / OS_DATA / OS_LOGS          (default $OS_ROOT/binaries | data | logs)
 #   SOURCE_DIR   tarball download dir    (default $BASE_DIR/softwares)
 #   NODE_NAME    node name, STANDALONE only (default os-node-1)
@@ -339,6 +341,20 @@ check_path() {
     echo "$val"
 }
 
+# ensure_base_layout BASE  -> checks <BASE>/softwares and <BASE>/apps, creates whichever is missing
+ensure_base_layout() {
+    local base="${1%/}" d
+    for d in "$base" "$base/softwares" "$base/apps"; do
+        if [ -d "$d" ]; then
+            ok "Directory present: $d"
+        else
+            mkdir -p "$d" || die "Could not create directory $d (check the mount and permissions)."
+            ok "Directory created: $d"
+        fi
+    done
+    [ -w "$base" ] || die "Base directory $base is not writable."
+}
+
 ensure_service_user() {
     local svc_user="$1" home_dir="$2"
     if id "$svc_user" >/dev/null 2>&1; then
@@ -384,7 +400,8 @@ MODE=$(prompt_mode "${MODE:-}") || exit 1
 OS_VERSION=$(prompt_nonempty "OpenSearch version to install" "3.3.2" "${OS_VERSION:-}") || exit 1
 [[ "$OS_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "OS_VERSION must look like 3.3.2, got '$OS_VERSION'."
 BASE_DIR=$(prompt_base_dir "Base volume/mount path to install under (e.g. /opt/mydata)" "/opt/ausiytic" "${BASE_DIR:-}") || exit 1
-OS_ROOT=$(prompt_base_dir "OpenSearch install root (binaries/data/logs go under it)" "${BASE_DIR}/search/opensearch" "${OS_ROOT:-}") || exit 1
+ensure_base_layout "$BASE_DIR"      # create <BASE_DIR>/softwares and <BASE_DIR>/apps if missing
+OS_ROOT=$(prompt_base_dir "OpenSearch install root (binaries/data/logs go under it)" "${BASE_DIR}/apps/opensearch" "${OS_ROOT:-}") || exit 1
 OS_HOME=$(check_path OS_HOME "${OS_HOME:-${OS_ROOT}/binaries}") || exit 1
 OS_DATA=$(check_path OS_DATA "${OS_DATA:-${OS_ROOT}/data}") || exit 1
 OS_LOGS=$(check_path OS_LOGS "${OS_LOGS:-${OS_ROOT}/logs}") || exit 1
@@ -1169,4 +1186,3 @@ if [ "$MODE" = "cluster" ] && [ -d "$BUNDLE_DIR" ]; then
     echo "Next: run this script on each remaining node with the same NODE_IPS / NODE_NAMES and its own THIS_NODE_IP."
 fi
 echo "Full install log: $LOG_FILE"
-

@@ -158,23 +158,24 @@ validate_and_prepare_base_dir() {
     echo "${dir}"
 }
 
-find_opensearch_root_ca() {
-    # Best-effort lookup of the root CA made by opensearch_install.sh
-    local candidates=(
-        "/data/opensearch/search/opensearch/binaries/config/certs/root-ca.pem"
-        "${BASE_DISK_DIR%/}/search/opensearch/binaries/config/certs/root-ca.pem"
-        "/opt/ausiytic/search/opensearch/binaries/config/certs/root-ca.pem"
-        "${BASE_DISK_DIR%/}/apps/opensearch/binaries/config/root-ca.pem"
-        "/opt/ausiytic/apps/opensearch/binaries/config/root-ca.pem"
-        "/apps/opensearch/binaries/config/root-ca.pem"
-    )
-    local c
-    for c in "${candidates[@]}"; do
-        [[ -f "${c}" ]] && { echo "${c}"; return 0; }
+ensure_base_layout() {
+    # Check <base>/softwares and <base>/apps; create whichever is missing.
+    local base="${1%/}" d
+    for d in "${base}/softwares" "${base}/apps"; do
+        if [[ -d "${d}" ]]; then
+            log "Directory present: ${d}"
+        else
+            mkdir -p "${d}" || fail "Could not create directory ${d} (check the mount and permissions)."
+            log "Directory created: ${d}"
+        fi
     done
-    local found
-    found="$(find / -maxdepth 9 \( -path /proc -o -path /sys -o -path /dev \) -prune -o -name root-ca.pem -path '*opensearch*' -print 2>/dev/null | head -n1 || true)"
-    [[ -n "${found}" ]] && { echo "${found}"; return 0; }
+}
+
+find_opensearch_root_ca() {
+    # No filesystem search: only look at the fixed location opensearch_install.sh uses
+    # under the chosen base dir (<base>/apps/opensearch). Anything else: --opensearch-root-ca.
+    local c="${BASE_DISK_DIR%/}/apps/opensearch/binaries/config/certs/root-ca.pem"
+    [[ -f "${c}" ]] && { echo "${c}"; return 0; }
     return 1
 }
 
@@ -219,6 +220,7 @@ step_prompt_inputs() {
         BASE_DISK_DIR="${normalized}"
     fi
 
+    ensure_base_layout "${BASE_DISK_DIR}"     # create softwares/ and apps/ if missing
     local base_join="${BASE_DISK_DIR%/}"
     BASE_SOFTWARE_DIR="${base_join}/softwares/opensearch-dashboards"
     APP_BASE_DIR="${base_join}/apps/opensearch-dashboards"
@@ -583,7 +585,7 @@ Usage: sudo $0 [options]
   --opensearch-port PORT       OpenSearch HTTP port (default: ${DEFAULT_OS_PORT}).
   --opensearch-user USER       OpenSearch user (default: ${DEFAULT_OS_USERNAME}).
   --opensearch-password PASS   Password (or env OS_ADMIN_PASSWORD / OS_PASSWORD). Prompted if omitted.
-  --opensearch-root-ca PATH    OpenSearch root-ca.pem for TLS trust (auto-detected if omitted).
+  --opensearch-root-ca PATH    OpenSearch root-ca.pem for TLS trust (default: <base-dir>/apps/opensearch/binaries/config/certs/root-ca.pem if present).
   --ssl-mode MODE              certificate (default) | full. Used when a root CA is found.
   --bind-host HOST             Listen address (default: 0.0.0.0).
   --service-user USER          Linux user for the service (default: ${SERVICE_USER}; created if missing).
