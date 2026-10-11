@@ -157,6 +157,19 @@ pipeline {
         // ---------------- Druid (druid_install.sh prompts) ----------------
         string(name: 'DRUID_VOLUME_NAME', defaultValue: 'ausiytic', description: "[druid] Volume: '/data' = absolute path, 'name' = under /opt, 'root' = /opt on root volume")
 
+        // ---------------- OpenSearch (opensearch_install.sh; the same value is used on every node) ----------------
+        string(name: 'OS_VERSION', defaultValue: '3.3.2', description: '[opensearch] OpenSearch version')
+        string(name: 'OS_BASE_DIR', defaultValue: '/data/opensearch', description: '[opensearch] Base volume / directory (install root = <base>/search/opensearch)')
+        string(name: 'OS_SERVICE_USER', defaultValue: 'opensearch', description: '[opensearch] OS user that runs OpenSearch (not root)')
+        string(name: 'OS_HTTP_PORT', defaultValue: '9200', description: '[opensearch] HTTP (REST) port')
+        string(name: 'OS_TRANSPORT_PORT', defaultValue: '9300', description: '[opensearch] Transport (node-to-node) port')
+        string(name: 'OS_CLUSTER_NAME', defaultValue: 'dev-01', description: '[opensearch] Cluster name')
+        string(name: 'OS_HEAP_SIZE', defaultValue: '', description: '[opensearch] JVM heap, e.g. 4g or 3888m (blank = 50% of each server RAM, max 31g)')
+        string(name: 'OS_NODE_NAMES', defaultValue: '', description: '[opensearch cluster] Node names, comma-separated, same order as the hosts (blank = os-node-1, os-node-2, ...)')
+        string(name: 'OS_CLUSTER_MANAGER_IPS', defaultValue: '', description: '[opensearch cluster] Cluster-manager-eligible node IPs, comma-separated (blank = first 3 hosts, or the first host if only 2)')
+        string(name: 'OS_NODE_ROLES', defaultValue: '', description: '[opensearch] Roles applied to EVERY node, e.g. data,ingest (blank = script default). Per node: OVERRIDES  opensearch-2.NODE_ROLES=data,ingest')
+        string(name: 'OSD_VERSION', defaultValue: '3.3.0', description: '[dashboards] OpenSearch Dashboards version')
+
         // ---------------- OpenSearch Dashboards (opensearch_dashboards_install.sh) ----------------
         string(name: 'OSD_BASE_DIR', defaultValue: '/data/opensearch-dashboards', description: '[dashboards] Base directory (admin password = Jenkins credential opensearch-admin-password)')
 
@@ -257,22 +270,22 @@ def projectConfig() {
     def CHROME_HOSTS         = P['chrome'] ?: pickHosts(params.CHROME_HOSTS, ['CHANGE_ME'])   // any servers that run Selenium/headless browsers
 
     // ---- 2. Shared values (defined once, used by several tasks) -------------
-    def OS_BASE  = '/data/opensearch'
+    def OS_BASE  = pv('OS_BASE_DIR', '/data/opensearch')
     def OS_ROOT  = OS_BASE + '/search/opensearch'       // opensearch_install.sh default: <BASE_DIR>/search/opensearch
     def OS_CRED  = 'opensearch-admin-password'          // Jenkins Secret-text credential ID (admin password)
 
     // opensearch_install.sh inputs (same on every node)
     def OS = [
-        OS_VERSION     : '3.3.2',
+        OS_VERSION     : pv('OS_VERSION', '3.3.2'),
         BASE_DIR       : OS_BASE,
         OS_ROOT        : OS_ROOT,
-        SERVICE_USER   : 'opensearch',
-        HTTP_PORT      : '9200',
-        TRANSPORT_PORT : '9300',
-        CLUSTER_NAME   : 'dev-01',
-        HEAP_SIZE      : ''                             // blank = 50% of RAM (max 31g); override per node, e.g. opensearch-2.HEAP_SIZE=1536m
+        SERVICE_USER   : pv('OS_SERVICE_USER', 'opensearch'),
+        HTTP_PORT      : pv('OS_HTTP_PORT', '9200'),
+        TRANSPORT_PORT : pv('OS_TRANSPORT_PORT', '9300'),
+        CLUSTER_NAME   : pv('OS_CLUSTER_NAME', 'dev-01'),
+        HEAP_SIZE      : pv('OS_HEAP_SIZE', '')                             // blank = 50% of RAM (max 31g); override per node, e.g. opensearch-2.HEAP_SIZE=1536m
     ]
-    def OSD_VERSION = '3.3.0'                           // OpenSearch Dashboards version
+    def OSD_VERSION = pv('OSD_VERSION', '3.3.0')                           // OpenSearch Dashboards version
     def OSD_BASE    = pv('OSD_BASE_DIR', '/data/opensearch-dashboards')
 
     def AIRFLOW = [
@@ -380,12 +393,12 @@ def projectConfig() {
     for (int i = 0; i < osCount; i++) {
         def oEnv = [:]
         oEnv.putAll(OS)
-        oEnv.putAll([MODE: osCluster ? 'cluster' : 'standalone', THIS_NODE_IP: OS_HOSTS[i], NODE_ROLES: ''])
+        oEnv.putAll([MODE: osCluster ? 'cluster' : 'standalone', THIS_NODE_IP: OS_HOSTS[i], NODE_ROLES: pv('OS_NODE_ROLES', '')])
         def oPatterns = [THIS_NODE_IP: ipv4Re]
         def oFetch = []
         if (osCluster) {
-            oEnv.putAll([NODE_IPS: OS_HOSTS.join(','), NODE_NAMES: osNames.join(','),
-                         CLUSTER_MANAGER_IPS: osMgrIps.join(','), TRANSFER_TO_PEERS: 'N',
+            oEnv.putAll([NODE_IPS: OS_HOSTS.join(','), NODE_NAMES: pv('OS_NODE_NAMES', osNames.join(',')),
+                         CLUSTER_MANAGER_IPS: pv('OS_CLUSTER_MANAGER_IPS', osMgrIps.join(',')), TRANSFER_TO_PEERS: 'N',
                          HEALTH_WAIT_SECS: (i == osCount - 1) ? '300' : '0'])    // only the last node waits for the full cluster
             oPatterns['NODE_IPS'] = ipv4ListRe
             oPatterns['CLUSTER_MANAGER_IPS'] = ipv4ListRe
