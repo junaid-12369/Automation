@@ -990,7 +990,7 @@ def ensureSharedSecrets(String name, Map grp) {
     }
     if (!(grp.path ==~ /^\/[A-Za-z0-9_.\/\-]+$/)) { error "Secret group '${name}': unsafe path '${grp.path}'" }
 
-    def sb = new StringBuilder()
+    def sb = []
     sb << '#!/bin/bash\nset -e\numask 077\n'
     sb << 'F=' + shq(grp.path) + '\n'
     sb << 'mkdir -p "$(dirname "$F")"\ntouch "$F"\nchmod 600 "$F"\n'
@@ -1015,7 +1015,7 @@ def ensureSharedSecrets(String name, Map grp) {
                                        keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER_CRED')]) {
         try {
             sh "mkdir -p ${ldir}"
-            writeFile(file: "${ldir}/gen.sh", text: sb.toString())
+            writeFile(file: "${ldir}/gen.sh", text: sb.join(''))
             sh "${SSH} ${target} 'mkdir -p ${rdir} && chmod 700 ${rdir}'"
             sh "${SCP} ${ldir}/gen.sh ${target}:${rdir}/gen.sh"
             // returnStdout: values are never echoed to the build log
@@ -1135,7 +1135,7 @@ def runTask(Map t, Map sharedSecrets) {
 
             // ---- generated run.sh (holds secrets; chmod 600; deleted after run) ----
             def exports = (t.mode == 'env') ? (vals.keySet() as List) : t.exportEnv
-            def sb = new StringBuilder()
+            def sb = []
             sb << "#!/bin/bash\n"
             for (k in exports) {
                 if (!(k ==~ /^[A-Za-z_][A-Za-z0-9_]*$/)) { error "[${t.id}] invalid env var name '${k}'" }
@@ -1151,7 +1151,7 @@ def runTask(Map t, Map sharedSecrets) {
                 sb << "exec bash ./${t.script} ${flags}\n"
             }
             sh "mkdir -p ${ldir}"
-            writeFile(file: "${ldir}/run.sh", text: sb.toString())
+            writeFile(file: "${ldir}/run.sh", text: sb.join(''))
             sh "chmod 600 ${ldir}/run.sh"
             sh "${SCP} ${ldir}/run.sh ${target}:${rdir}/run.sh"
 
