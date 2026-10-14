@@ -15,7 +15,7 @@
      SPARK_WORKER_HOSTS) - tasks are generated with a for-loop.
 
  SCRIPT PROMPTS = BUILD PARAMETERS  (new in v5)
-   Interactive scripts (pg, httpd, nifi, druid, dashboards, kafka, polaris, chrome)
+   Interactive scripts (pg, httpd, nifi, dashboards, kafka, polaris, chrome)
    ask questions when run by hand. Jenkins cannot stop mid-run and ask, so every
    question is a build parameter on the "Build with Parameters" page (with the same
    default you would normally type). The pipeline pipes those values to the script.
@@ -42,6 +42,46 @@
                                          opensearch-3.NODE_ROLES=data,ingest
                                          CLUSTER_MANAGER_IPS=10.0.1.21,10.0.1.22,10.0.1.23
 
+ ZOOKEEPER  (install_zookeeper.sh - single node OR ensemble, env mode)
+   Needed by a Druid CLUSTER (DRUID_ZK_HOSTS). Service name: zookeeper (may be placed on MANY servers).
+   - Hosts come from SERVERS (zookeeper = ...), the ZOOKEEPER_HOSTS parameter, or the default in projectConfig().
+     Host order = myid order: first host = myid 1, second = myid 2, ... The SAME host list goes to every node,
+     the myid is set per node by Jenkins, so the script never prompts.
+   - Use an ODD number of nodes (1, 3 or 5): a quorum needs a majority, so 2 or 4 nodes add no fault tolerance.
+   - All nodes install in wave 1, in parallel, before Druid (wave 2/3). The ensemble only forms once a majority
+     is running, so a node's own 'status' check may not show a Mode while the others are still installing
+     (the script only logs that - it is not a failure).
+   - DRUID_ZK_HOSTS blank => Druid uses the ZooKeeper hosts of the same run (SERVERS / ZOOKEEPER_HOSTS).
+   - Tune with the ZK_* build parameters, or per node with OVERRIDES, e.g.  zookeeper-2.TICK_TIME=3000
+   - Disabled by default (like airflow / spark / kafka): run it with SERVERS or ONLY=zookeeper, e.g.
+         10.0.1.11 = zookeeper
+         10.0.1.12 = zookeeper
+         10.0.1.13 = zookeeper
+   - Put install_zookeeper.sh in ./scripts/.
+
+ DRUID  (install_druid.sh - standalone AND 3-node cluster, env mode)
+   Every prompt of install_druid.sh is a build parameter prefixed DRUID_ (blank = the script's own default).
+   - DRUID_MODE = standalone  => ONE server, service name 'druid'.
+     DRUID_MODE = cluster     => three single-instance services: druid-master (Coordinator+Overlord),
+                                 druid-data (Historical+MiddleManager), druid-query (Broker+Router).
+     (If SERVERS places druid-master / druid-data / druid-query, that wins over DRUID_MODE.)
+   - Cluster order: master = wave 2 (bootstraps the metadata + auth tables), data + query = wave 3 (parallel).
+   - Cluster needs an EXTERNAL ZooKeeper ensemble (DRUID_ZK_HOSTS; blank = the ZooKeeper hosts of this run, see ZOOKEEPER above) and a shared PostgreSQL
+     (defaults to the 'pg' host; or DRUID_META_DB_HOST). Deep storage must be shared: s3 or azure.
+   - PASSWORDS (never form fields):
+       * Druid admin + internal-client passwords are AUTO-GENERATED ONCE (secret group 'druid', stored root-only
+         on the master/standalone host in /etc/druid-cluster/cluster.keys) and the SAME values are injected into
+         every Druid node. BACK UP that file. For an already-running cluster, put its existing two passwords
+         into that file (ADMIN_INIT_PASSWORD=..., INTERNAL_CLIENT_PASSWORD=...) before the first Jenkins run.
+       * Jenkins "Secret text" credentials (only needed when the feature is on, same value on every node):
+           druid-pg-password        PostgreSQL metadata password   (cluster, or DRUID_USE_PG ticked)
+           druid-azure-key          Azure storage key              (DRUID_STORAGE_TYPE = azure)
+           druid-zk-sasl-password   ZooKeeper SASL password        (DRUID_ZK_SASL ticked)
+   - Adding ONE node later: SERVERS = "10.0.1.51 = druid-data" plus DRUID_MASTER_HOST (where the shared
+     key file lives) and the same DRUID_ZK_HOSTS / DRUID_META_DB_* / storage parameters.
+   - Per-node tuning with OVERRIDES, e.g.  druid-data.HEAP_HIST=4g   druid-query.HEAP_BROKER=2g
+   - Rename "install_druid (2).sh" to install_druid.sh in ./scripts/.
+
  PLACING SERVICES ON SERVERS  (the build parameter SERVERS)
    Give the pipeline your servers and say which services each one gets - any
    service on any server, any number of servers, several services per server:
@@ -54,7 +94,7 @@
 
    When SERVERS is filled in, EXACTLY the listed services run, on exactly those
    hosts (enabled flags are ignored). Services that may go on many servers:
-   opensearch, airflow-worker, spark-worker, kafka, chrome. All others go on ONE server.
+   opensearch, zookeeper, airflow-worker, spark-worker, kafka, chrome. All others go on ONE server.
    Service names: see knownServices() near the bottom. Several services on the
    same host install one after another; different hosts install in parallel.
    Values for things NOT placed this run (e.g. the Airflow control IP when you
@@ -64,9 +104,9 @@
 
  TWO TASK MODES
    mode:'env'   (default) Script supports AUTOMATED=1 + env vars
-                (opensearch_install.sh, airflow_cluster_*.sh, spark_install.sh,
+                (opensearch_install.sh, install_druid.sh, install_zookeeper.sh, airflow_cluster_*.sh, spark_install.sh,
                 spark_standalone_install.sh). All of task.env + credentials are exported to the script.
-   mode:'stdin' Legacy interactive scripts (pg_install_master.sh, druid, nifi,
+   mode:'stdin' Legacy interactive scripts (pg_install_master.sh, nifi,
                 httpd, opensearch dashboards). Answers are piped in, in the order the
                 script asks. Use {{VAR}} tokens to pull values from task.env /
                 credentials into the answer lines.
@@ -134,6 +174,7 @@ pipeline {
         string(name: 'SPARK_WORKERS', defaultValue: '', description: 'Spark worker IPs, comma-separated, any number (blank = list in projectConfig())')
         string(name: 'KAFKA_HOSTS', defaultValue: '', description: 'Kafka server IPs, comma-separated, any number (blank = list in projectConfig()). Each gets its OWN single-node KRaft broker.')
         string(name: 'CHROME_HOSTS', defaultValue: '', description: 'Servers that need Chrome + ChromeDriver, comma-separated, any number (blank = list in projectConfig())')
+        string(name: 'ZOOKEEPER_HOSTS', defaultValue: '', description: 'ZooKeeper ensemble hosts, comma-separated, in myid order (first = myid 1). Use an odd number: 1, 3 or 5 (blank = list in projectConfig()). Also the default for DRUID_ZK_HOSTS')
         booleanParam(name: 'PARALLEL_HOSTS', defaultValue: true, description: 'Run different hosts of the same wave in parallel')
         booleanParam(name: 'DRY_RUN', defaultValue: false, description: 'Validate and print plan only')
 
@@ -154,8 +195,49 @@ pipeline {
         string(name: 'NIFI_ADMIN_USER', defaultValue: 'admin', description: '[nifi] Admin user (password = Jenkins credential nifi-admin-password, min 12 chars)')
         choice(name: 'NIFI_PROXY_CHOICE', choices: ['2', '1', '3'], description: '[nifi] Proxy host choice: 1=public 2=private 3=both')
 
-        // ---------------- Druid (druid_install.sh prompts) ----------------
-        string(name: 'DRUID_VOLUME_NAME', defaultValue: 'ausiytic', description: "[druid] Volume: '/data' = absolute path, 'name' = under /opt, 'root' = /opt on root volume")
+        // ---------------- ZooKeeper (install_zookeeper.sh; hosts = SERVERS / ZOOKEEPER_HOSTS) ----------------
+        string(name: 'ZK_VERSION', defaultValue: '3.8.5', description: '[zookeeper] Apache ZooKeeper version')
+        string(name: 'ZK_DISK_NAME', defaultValue: '/opt', description: "[zookeeper] Disk / mount point that must already exist ('/opt' -> installs under /opt/ausiytic, '/' = root volume)")
+        string(name: 'ZK_CLIENT_PORT', defaultValue: '2181', description: '[zookeeper] Client port')
+        string(name: 'ZK_PEER_PORT', defaultValue: '2888', description: '[zookeeper] Peer (follower-to-leader) port')
+        string(name: 'ZK_ELECTION_PORT', defaultValue: '3888', description: '[zookeeper] Leader-election port')
+        string(name: 'ZK_TICK_TIME', defaultValue: '2000', description: '[zookeeper] tickTime in ms')
+        string(name: 'ZK_INIT_LIMIT', defaultValue: '10', description: '[zookeeper] initLimit (ticks)')
+        string(name: 'ZK_SYNC_LIMIT', defaultValue: '5', description: '[zookeeper] syncLimit (ticks)')
+
+        // ---------------- Druid (install_druid.sh prompts; passwords = auto-generated shared secrets / Jenkins credentials) ----------------
+        choice(name: 'DRUID_MODE', choices: ['standalone', 'cluster'], description: '[druid] standalone = one server (service druid); cluster = 3 nodes (services druid-master, druid-data, druid-query). Ignored when SERVERS places a druid service')
+        string(name: 'DRUID_VERSION', defaultValue: '36.0.0', description: '[druid] Apache Druid version')
+        string(name: 'DRUID_VOLUME_NAME', defaultValue: 'ausiytic', description: "[druid] Install location: '/data' = absolute path, 'name' = under /opt, 'root' = /opt on root volume")
+        string(name: 'DRUID_SERVICE_USER', defaultValue: '', description: '[druid] OS service user (blank = script default: edxiuser standalone, vantagex cluster)')
+        string(name: 'DRUID_MASTER_HOST', defaultValue: '', description: '[druid cluster] Master node IP. Only needed when SERVERS does not place druid-master (e.g. adding one data node later): it is where the shared password file lives')
+        string(name: 'DRUID_ZK_HOSTS', defaultValue: '', description: '[druid cluster] External ZooKeeper ensemble, comma-separated, same list/order on all nodes, e.g. 10.0.0.11,10.0.0.12,10.0.0.13 (blank = the ZooKeeper hosts of this run: SERVERS / ZOOKEEPER_HOSTS)')
+        booleanParam(name: 'DRUID_ZK_SASL', defaultValue: false, description: '[druid cluster] ZooKeeper requires SASL/JAAS auth (password = Jenkins credential druid-zk-sasl-password)')
+        string(name: 'DRUID_ZK_SASL_USERNAME', defaultValue: 'druid', description: '[druid cluster] ZooKeeper SASL username')
+        booleanParam(name: 'DRUID_USE_PG', defaultValue: false, description: '[druid standalone] Use PostgreSQL metadata instead of Derby (always on for cluster). Password = Jenkins credential druid-pg-password')
+        string(name: 'DRUID_META_DB_HOST', defaultValue: '', description: '[druid] PostgreSQL host/IP (blank = the pg server of this run)')
+        string(name: 'DRUID_META_DB_PORT', defaultValue: '5432', description: '[druid] PostgreSQL port')
+        string(name: 'DRUID_META_DB_NAME', defaultValue: 'druid', description: '[druid] PostgreSQL database name (must already exist)')
+        string(name: 'DRUID_META_DB_USER', defaultValue: 'druid', description: '[druid] PostgreSQL user (must already exist)')
+        choice(name: 'DRUID_STORAGE_TYPE', choices: ['local', 's3', 'azure'], description: '[druid] Deep storage. Cluster: use s3 or azure (local only works on a shared/NFS mount)')
+        string(name: 'DRUID_S3_BUCKET', defaultValue: '', description: '[druid] S3 bucket (required for s3; uses the instance role)')
+        string(name: 'DRUID_S3_BASE_KEY', defaultValue: 'druid/segments', description: '[druid] S3 key prefix')
+        string(name: 'DRUID_AZURE_ACCOUNT', defaultValue: '', description: '[druid] Azure storage account (required for azure; key = Jenkins credential druid-azure-key)')
+        string(name: 'DRUID_AZURE_CONTAINER', defaultValue: 'druid', description: '[druid] Azure storage container')
+        string(name: 'DRUID_HEAP_COORD', defaultValue: '', description: '[druid] Coordinator+Overlord heap, e.g. 1g (blank = script default)')
+        string(name: 'DRUID_HEAP_BROKER', defaultValue: '', description: '[druid] Broker heap (blank = script default)')
+        string(name: 'DRUID_DIRECT_BROKER', defaultValue: '', description: '[druid] Broker direct memory (blank = script default)')
+        string(name: 'DRUID_HEAP_HIST', defaultValue: '', description: '[druid] Historical heap (blank = script default)')
+        string(name: 'DRUID_DIRECT_HIST', defaultValue: '', description: '[druid] Historical direct memory (blank = script default)')
+        string(name: 'DRUID_HEAP_MM', defaultValue: '', description: '[druid] MiddleManager heap (blank = script default)')
+        string(name: 'DRUID_HEAP_PEON', defaultValue: '', description: '[druid] Per-task (peon) heap (blank = script default)')
+        string(name: 'DRUID_DIRECT_PEON', defaultValue: '', description: '[druid] Per-task (peon) direct memory (blank = script default)')
+        string(name: 'DRUID_HEAP_ROUTER', defaultValue: '', description: '[druid] Router heap (blank = script default)')
+        string(name: 'DRUID_DIRECT_ROUTER', defaultValue: '', description: '[druid] Router direct memory (blank = script default)')
+        string(name: 'DRUID_WORKER_CAPACITY', defaultValue: '', description: '[druid] Peon slots per MiddleManager (blank = 2 standalone / 3 cluster)')
+        string(name: 'DRUID_SEGMENT_CACHE_MAX_SIZE', defaultValue: '', description: '[druid] Historical segment cache size, e.g. 200g (blank = 50g)')
+        string(name: 'DRUID_EXTRA_EXTENSIONS', defaultValue: '', description: '[druid] Extra Druid extensions, comma-separated (blank = none)')
+        booleanParam(name: 'DRUID_RECONFIGURE', defaultValue: false, description: '[druid] Pass --reconfigure (needed to change settings on an already-installed server)')
 
         // ---------------- OpenSearch (opensearch_install.sh; the same value is used on every node) ----------------
         string(name: 'OS_VERSION', defaultValue: '3.3.2', description: '[opensearch] OpenSearch version')
@@ -245,11 +327,18 @@ def projectConfig() {
     // OpenSearch nodes, in node order. 1 host = standalone, 2+ = cluster. Must be IPv4 addresses.
     def OS_HOSTS = P['opensearch'] ?: pickHosts(params.OPENSEARCH_HOSTS, ['172.31.6.212'])
 
+    // Druid: cluster (3 services) or standalone (1 service). SERVERS placement wins over the DRUID_MODE parameter.
+    def druidCluster = P.containsKey('druid-master') || P.containsKey('druid-data') || P.containsKey('druid-query')
+    if (!druidCluster && !P.containsKey('druid') && pv('DRUID_MODE', 'standalone') == 'cluster') { druidCluster = true }
+
     // Default host per service is used only when SERVERS does not place that service.
     def S = [
         PG           : hostOf(P, 'pg',               '172.31.6.212'),
         OPENSEARCH   : OS_HOSTS[0],                                  // first node: Dashboards connects here, CA is fetched from here
-        DRUID        : hostOf(P, 'druid',            '172.31.11.87'),
+        DRUID        : hostOf(P, 'druid',            '172.31.11.87'),   // standalone Druid
+        DRUID_MASTER : hostOf(P, 'druid-master',     pv('DRUID_MASTER_HOST', 'CHANGE_ME')),   // cluster: Coordinator + Overlord
+        DRUID_DATA   : hostOf(P, 'druid-data',       'CHANGE_ME'),                            // cluster: Historical + MiddleManager
+        DRUID_QUERY  : hostOf(P, 'druid-query',      'CHANGE_ME'),                            // cluster: Broker + Router
         NIFI         : hostOf(P, 'nifi',             '172.31.10.254'),
         HTTPD        : hostOf(P, 'httpd',            '172.31.3.85'),
         DASHBOARDS   : hostOf(P, 'dashboards',       '172.31.3.85'),
@@ -268,6 +357,10 @@ def projectConfig() {
     def SPARK_WORKER_HOSTS   = P['spark-worker'] ?: pickHosts(params.SPARK_WORKERS, ['CHANGE_ME'])   // e.g. ['10.0.2.31', '10.0.2.32', ...]
     def KAFKA_HOSTS          = P['kafka'] ?: pickHosts(params.KAFKA_HOSTS, ['CHANGE_ME'])   // one independent single-node broker per host
     def CHROME_HOSTS         = P['chrome'] ?: pickHosts(params.CHROME_HOSTS, ['CHANGE_ME'])   // any servers that run Selenium/headless browsers
+    // ZooKeeper ensemble in myid order (host 1 = myid 1, ...). Use an ODD number of nodes. The hosts given via
+    // SERVERS / ZOOKEEPER_HOSTS are also the default for DRUID_ZK_HOSTS (ZK_EXPLICIT is empty when none were given).
+    def ZK_EXPLICIT          = P['zookeeper'] ?: pickHosts(params.ZOOKEEPER_HOSTS, [])
+    def ZK_NODE_HOSTS        = ZK_EXPLICIT ?: ['CHANGE_ME']
 
     // ---- 2. Shared values (defined once, used by several tasks) -------------
     def OS_BASE  = pv('OS_BASE_DIR', '/data/opensearch')
@@ -330,6 +423,12 @@ def projectConfig() {
             host: S.REDIS,
             path: '/etc/redis-cluster/cluster.keys',
             keys: [REDIS_PASSWORD: 'password']
+        ],
+        // Druid console admin + internal-client passwords: generated once, identical on every Druid node.
+        druid: [
+            host: druidCluster ? S.DRUID_MASTER : S.DRUID,
+            path: '/etc/druid-cluster/cluster.keys',
+            keys: [ADMIN_INIT_PASSWORD: 'password', INTERNAL_CLIENT_PASSWORD: 'password']
         ]
     ]
 
@@ -341,14 +440,6 @@ def projectConfig() {
         MASTER_PORT    : '7077'
     ]
 
-    def DRUID = [
-        VOLUME_NAME : pv('DRUID_VOLUME_NAME', 'ausiytic'),   // '/data' = absolute; 'name' = under /opt; 'root' = /opt on root volume
-        RECONFIGURE : false,            // true => --reconfigure (needed to change settings on an already-installed server)
-        USE_PG      : false,
-        PG_PORT     : '5432', PG_DBNAME: 'druid', PG_USER: 'druid',
-        USE_AZURE   : false,
-        AZ_ACCOUNT  : '', AZ_CONTAINER: 'druid'
-    ]
 
     def tasks = []
 
@@ -426,34 +517,118 @@ def projectConfig() {
         )
     }
 
-    // ---- DB2: Druid -----------------------------------------------------------
-    // stdin order (only read on first run / --reconfigure):
-    //   VOLUME_NAME, PG host(+port,db,user,pw if set), Azure acct(+container,key if set),
-    //   admin password, internal password
-    def druidLines = ['{{DRUID_VOLUME_NAME}}']
+    // ---- DB3: ZooKeeper (single node OR ensemble) -------------------------------------
+    // install_zookeeper.sh in env mode. Every host in the list is one ensemble member:
+    //   host #1 = myid 1, host #2 = myid 2, ...   task ids 'zookeeper-1' .. 'zookeeper-N'
+    // The SAME ZK_HOSTS list goes to every node and MYID is set per node, so the script never prompts.
+    // All nodes are wave 1 (parallel) = up before Druid (wave 2/3). The ensemble forms once a majority runs,
+    // so one node's own 'status' check may not show a Mode yet - the script only logs that, it is not a failure.
+    // Disabled by default: run with SERVERS (zookeeper = ...) or ONLY=zookeeper. Use an ODD number of nodes.
+    def zkDisk = pv('ZK_DISK_NAME', '/opt')
+    if (zkDisk.length() > 1) { zkDisk = zkDisk.replaceAll('/+$', '') }
+    for (int i = 0; i < ZK_NODE_HOSTS.size(); i++) {
+        tasks << newTask(
+            id: "zookeeper-${i + 1}", service: 'zookeeper', tags: ['db', 'zookeeper'], wave: 1, host: ZK_NODE_HOSTS[i], enabled: false,
+            script: 'install_zookeeper.sh', mode: 'env', timeoutMin: 30,
+            env: [ZK_VERSION    : pv('ZK_VERSION', '3.8.5'),
+                  DISK_NAME     : zkDisk,
+                  ZK_HOSTS      : ZK_NODE_HOSTS.join(','),
+                  MYID          : "${i + 1}",
+                  CLIENT_PORT   : pv('ZK_CLIENT_PORT', '2181'),
+                  PEER_PORT     : pv('ZK_PEER_PORT', '2888'),
+                  ELECTION_PORT : pv('ZK_ELECTION_PORT', '3888'),
+                  TICK_TIME     : pv('ZK_TICK_TIME', '2000'),
+                  INIT_LIMIT    : pv('ZK_INIT_LIMIT', '10'),
+                  SYNC_LIMIT    : pv('ZK_SYNC_LIMIT', '5')],
+            required: ['DISK_NAME', 'ZK_HOSTS', 'MYID'],
+            patterns: [ZK_VERSION: '^[0-9]+[.][0-9]+[.][0-9]+$',
+                       DISK_NAME: '^/[A-Za-z0-9_./-]*$',
+                       ZK_HOSTS: '^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$',
+                       MYID: '^[1-9][0-9]*$',
+                       CLIENT_PORT: '^[1-9][0-9]*$', PEER_PORT: '^[1-9][0-9]*$', ELECTION_PORT: '^[1-9][0-9]*$',
+                       TICK_TIME: '^[1-9][0-9]*$', INIT_LIMIT: '^[1-9][0-9]*$', SYNC_LIMIT: '^[1-9][0-9]*$'],
+            preDirs: (zkDisk == '/') ? [] : [zkDisk]         // the script dies if the disk path is missing
+        )
+    }
+
+    // ---- DB2: Druid (standalone OR 3-node cluster) -----------------------------------
+    // install_druid.sh in env mode: every prompt is a DRUID_* build parameter (see the parameters block).
+    //   standalone -> task id 'druid'
+    //   cluster    -> 'druid-master' (wave 2, bootstraps metadata/auth), then 'druid-data' + 'druid-query' (wave 3, parallel)
+    // Passwords: admin + internal-client are auto-generated once and shared with every node (secret group 'druid');
+    // the PostgreSQL / Azure / ZooKeeper-SASL passwords are Jenkins Secret-text credentials (same on all nodes).
+    def druidUsePg   = druidCluster || (params.DRUID_USE_PG ? true : false)
+    def druidStorage = pv('DRUID_STORAGE_TYPE', 'local')
+    def druidSasl    = (druidCluster && params.DRUID_ZK_SASL) ? true : false
+    def druidVolume  = pv('DRUID_VOLUME_NAME', 'ausiytic')
+
     def druidCreds = [:]
-    if (DRUID.USE_PG) {
-        druidLines += [S.PG, DRUID.PG_PORT, DRUID.PG_DBNAME, DRUID.PG_USER, '{{DRUID_PG_PASSWORD}}']
-        druidCreds['DRUID_PG_PASSWORD'] = 'druid-pg-password'
-    } else {
-        druidLines += ['']
+    def druidReq   = ['ADMIN_INIT_PASSWORD', 'INTERNAL_CLIENT_PASSWORD']
+    if (druidUsePg)                 { druidCreds['META_DB_PASS'] = 'druid-pg-password';         druidReq += ['META_DB_HOST', 'META_DB_PASS'] }
+    if (druidStorage == 'azure')    { druidCreds['AZURE_STORAGE_KEY'] = 'druid-azure-key';       druidReq += ['AZURE_STORAGE_ACCOUNT', 'AZURE_STORAGE_KEY'] }
+    if (druidStorage == 's3')       { druidReq += ['S3_BUCKET'] }
+    if (druidSasl)                  { druidCreds['ZK_SASL_PASSWORD'] = 'druid-zk-sasl-password'; druidReq += ['ZK_SASL_USERNAME'] }
+    if (druidCluster)               { druidReq += ['ZK_HOSTS', 'NODE_IP'] }
+
+    def druidSize = '^[1-9][0-9]*[mMgG]$'
+    def druidPatterns = [DRUID_VERSION: '^[0-9]+[.][0-9]+[.][0-9]+$', WORKER_CAPACITY: '^[1-9][0-9]*$',
+                         SEGMENT_CACHE_MAX_SIZE: druidSize]
+    for (k in ['HEAP_COORD', 'HEAP_BROKER', 'DIRECT_BROKER', 'HEAP_HIST', 'DIRECT_HIST', 'HEAP_MM',
+               'HEAP_PEON', 'DIRECT_PEON', 'HEAP_ROUTER', 'DIRECT_ROUTER']) { druidPatterns[k] = druidSize }
+
+    def druidNodes = druidCluster ?
+        [[id: 'druid-master', svc: 'druid-master', role: 'master', host: S.DRUID_MASTER, wave: 2],
+         [id: 'druid-data',   svc: 'druid-data',   role: 'data',   host: S.DRUID_DATA,   wave: 3],
+         [id: 'druid-query',  svc: 'druid-query',  role: 'query',  host: S.DRUID_QUERY,  wave: 3]] :
+        [[id: 'druid', svc: 'druid', role: '', host: S.DRUID, wave: 2]]
+
+    for (n in druidNodes) {
+        def dEnv = [
+            INSTALL_MODE           : druidCluster ? 'cluster' : 'standalone',
+            NODE_ROLE              : n.role,
+            NODE_IP                : n.host,
+            DRUID_VERSION          : pv('DRUID_VERSION', '36.0.0'),
+            DISK_NAME              : druidVolume,
+            DRUID_SERVICE_USER     : pv('DRUID_SERVICE_USER', ''),
+            ZK_HOSTS               : druidCluster ? pv('DRUID_ZK_HOSTS', ZK_EXPLICIT.join(',')) : '',   // blank param = ZooKeeper hosts of this run
+            ZK_SASL_ENABLED        : druidSasl ? 'yes' : 'no',
+            ZK_SASL_USERNAME       : druidSasl ? pv('DRUID_ZK_SASL_USERNAME', 'druid') : '',
+            META_DB_HOST           : druidUsePg ? pv('DRUID_META_DB_HOST', S.PG) : '',
+            META_DB_PORT           : druidUsePg ? pv('DRUID_META_DB_PORT', '5432') : '',
+            META_DB_NAME           : druidUsePg ? pv('DRUID_META_DB_NAME', 'druid') : '',
+            META_DB_USER           : druidUsePg ? pv('DRUID_META_DB_USER', 'druid') : '',
+            STORAGE_TYPE           : druidStorage,
+            S3_BUCKET              : (druidStorage == 's3') ? pv('DRUID_S3_BUCKET', '') : '',
+            S3_BASE_KEY            : (druidStorage == 's3') ? pv('DRUID_S3_BASE_KEY', 'druid/segments') : '',
+            AZURE_STORAGE_ACCOUNT  : (druidStorage == 'azure') ? pv('DRUID_AZURE_ACCOUNT', '') : '',
+            AZURE_STORAGE_CONTAINER: (druidStorage == 'azure') ? pv('DRUID_AZURE_CONTAINER', 'druid') : '',
+            HEAP_COORD             : pv('DRUID_HEAP_COORD', ''),
+            HEAP_BROKER            : pv('DRUID_HEAP_BROKER', ''),
+            DIRECT_BROKER          : pv('DRUID_DIRECT_BROKER', ''),
+            HEAP_HIST              : pv('DRUID_HEAP_HIST', ''),
+            DIRECT_HIST            : pv('DRUID_DIRECT_HIST', ''),
+            HEAP_MM                : pv('DRUID_HEAP_MM', ''),
+            HEAP_PEON              : pv('DRUID_HEAP_PEON', ''),
+            DIRECT_PEON            : pv('DRUID_DIRECT_PEON', ''),
+            HEAP_ROUTER            : pv('DRUID_HEAP_ROUTER', ''),
+            DIRECT_ROUTER          : pv('DRUID_DIRECT_ROUTER', ''),
+            WORKER_CAPACITY        : pv('DRUID_WORKER_CAPACITY', ''),
+            SEGMENT_CACHE_MAX_SIZE : pv('DRUID_SEGMENT_CACHE_MAX_SIZE', ''),
+            EXTRA_EXTENSIONS       : pv('DRUID_EXTRA_EXTENSIONS', '')
+        ]
+        tasks << newTask(
+            id: n.id, service: n.svc, tags: ['db', 'druid'], wave: n.wave, host: n.host,
+            script: 'install_druid.sh', mode: 'env', timeoutMin: 90,
+            env: dEnv,
+            creds: druidCreds,
+            // identical admin / internal-client passwords on every node (generated once on the master / standalone host)
+            secrets: [[group: 'druid', keys: ['ADMIN_INIT_PASSWORD', 'INTERNAL_CLIENT_PASSWORD']]],
+            required: druidReq,
+            patterns: druidPatterns,
+            flags: params.DRUID_RECONFIGURE ? '--reconfigure' : '',
+            preDirs: druidPreDirs(druidVolume)               // prompt_volume() needs the directory to exist
+        )
     }
-    if (DRUID.USE_AZURE) {
-        druidLines += [DRUID.AZ_ACCOUNT, DRUID.AZ_CONTAINER, '{{DRUID_AZURE_KEY}}']
-        druidCreds['DRUID_AZURE_KEY'] = 'druid-azure-key'
-    } else {
-        druidLines += ['']
-    }
-    druidLines += ['', '']                                   // blank = script auto-generates both passwords
-    tasks << newTask(
-        id: 'druid', service: 'druid', tags: ['db', 'druid'], wave: 2, host: S.DRUID,
-        script: 'druid_install.sh', mode: 'stdin',
-        env: [DRUID_VOLUME_NAME: DRUID.VOLUME_NAME],
-        creds: druidCreds,
-        flags: DRUID.RECONFIGURE ? '--reconfigure' : '',
-        stdin: druidLines,
-        preDirs: druidPreDirs(DRUID.VOLUME_NAME)             // prompt_volume() loops forever if dir is missing
-    )
 
     // ---- DI: NiFi ---------------------------------------------------------------
     // stdin order: DISK_MOUNT, ADMIN_USER, ADMIN_PASS, ADMIN_PASS(confirm), PROXY_CHOICE[, CUSTOM_HOST]
@@ -719,7 +894,7 @@ def sparkEnv(Map base, Map extra) {
     return e
 }
 
-// Same path resolution as druid_install.sh v6: '/x' absolute, 'name' -> /opt/name, 'root' -> nothing to create
+// Same path resolution as install_druid.sh: '/x' absolute, 'name' -> /opt/name, 'root' -> nothing to create
 def druidPreDirs(String raw) {
     def v = raw.trim().replaceAll('/+$', '')
     if (v == 'root' || v == '') { return [] }
@@ -732,14 +907,14 @@ def druidPreDirs(String raw) {
 
 // Every service name the SERVERS parameter accepts.
 def knownServices() {
-    return ['pg', 'opensearch', 'dashboards', 'druid', 'nifi', 'httpd', 'redis',
+    return ['pg', 'opensearch', 'dashboards', 'zookeeper', 'druid', 'druid-master', 'druid-data', 'druid-query', 'nifi', 'httpd', 'redis',
             'airflow-control', 'airflow-worker', 'spark-master', 'spark-worker', 'spark-standalone',
             'kafka', 'chrome', 'polaris']
 }
 
 // Services that may be placed on MANY servers; everything else is one-per-project.
 def multiServices() {
-    return ['opensearch', 'airflow-worker', 'spark-worker', 'kafka', 'chrome']
+    return ['opensearch', 'zookeeper', 'airflow-worker', 'spark-worker', 'kafka', 'chrome']
 }
 
 // "host = svc, svc" lines  ->  [service: [hosts]]
@@ -1222,4 +1397,3 @@ def fetchThenPush(String SSH_SRC, String SCP_SRC, String SCP_DST, String srcHost
         sh "rm -f ${tmp} || true"
     }
 }
-
